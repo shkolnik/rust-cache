@@ -7,6 +7,15 @@ export type LayerStrategy = "exact-first" | "nearest-first";
 type RestoreOptions = Parameters<GhCache["restoreCache"]>[3];
 
 /**
+ * The very comparison `src/restore.ts` makes to decide whether a restore was a full match. It has
+ * to stay the same one: write-back happens exactly when that comparison says the save step will
+ * not run, and a divergence would either double the work or skip the write-back entirely.
+ */
+function isExactMatch(restoredKey: string, primaryKey: string): boolean {
+  return restoredKey.localeCompare(primaryKey, undefined, { sensitivity: "accent" }) === 0;
+}
+
+/**
  * Composes providers into a single cache, ordered nearest (cheapest) first.
  *
  * A layer that fails degrades to the next one, and never fails the run.
@@ -33,7 +42,9 @@ export function createLayeredCache(providers: CacheProvider[], strategy: LayerSt
    *
    * This has to happen here rather than in `saveCache`: `restore.ts` only calls `config.saveState()`
    * when the restored key is not an exact match, and `save.ts` does nothing without that state, so
-   * an exact hit never reaches `saveCache` at all.
+   * an exact hit never reaches `saveCache` at all. By the same rule it is only ever called for an
+   * exact match — anything else is followed by a `saveCache` that writes every layer anyway, and
+   * writing twice would put a second full compression on the restore path.
    */
   async function writeBack(nearer: CacheProvider[], paths: string[], key: string, options: RestoreOptions) {
     if (!nearer.length) {
@@ -77,7 +88,11 @@ export function createLayeredCache(providers: CacheProvider[], strategy: LayerSt
             continue;
           }
           core.info(`Cache layer "${provider.name}" served "${restoredKey}".`);
-          await writeBack(providers.slice(0, index), paths, restoredKey, options);
+          if (isExactMatch(restoredKey, primaryKey)) {
+            await writeBack(providers.slice(0, index), paths, restoredKey, options);
+          } else if (index > 0) {
+            core.info(`Not writing "${restoredKey}" back: the save step writes every layer after a partial hit.`);
+          }
           return restoredKey;
         }
       }

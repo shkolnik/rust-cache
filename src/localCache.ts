@@ -132,16 +132,22 @@ export function createLocalCache(configuredDir: string): GhCache {
         listeners: { stdout: memberMatcher(wanted, supplied) },
       });
 
+      if (wanted.length && !supplied.size) {
+        // Reported as a miss, not a hit: a hit here would be an exact-key match that delivered
+        // nothing, which stops a layered stack from consulting the next layer and stops the action
+        // from re-saving. Both leave the bad entry in place forever.
+        core.warning(
+          `The local cache entry "${key}" holds none of the requested paths (${wanted.join(", ")});` +
+            ` it was saved from a different layout and has been restored to its own recorded locations instead.` +
+            ` Treating it as a miss.`,
+        );
+        return undefined;
+      }
+
       core.info(
         `Restored "${key}" from the local cache at ${cacheDir}` +
           ` (${supplied.size}/${wanted.length} of the requested paths).`,
       );
-      if (wanted.length && !supplied.size) {
-        core.warning(
-          `The local cache entry "${key}" holds none of the requested paths (${wanted.join(", ")});` +
-            ` it was saved from a different layout and has been restored to its own recorded locations instead.`,
-        );
-      }
       return key;
     },
 

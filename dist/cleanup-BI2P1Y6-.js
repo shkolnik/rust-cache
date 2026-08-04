@@ -34396,6 +34396,14 @@ function parse(toml, { maxDepth = 1000, integersAsBigInt } = {}) {
 }
 
 /**
+ * The very comparison `src/restore.ts` makes to decide whether a restore was a full match. It has
+ * to stay the same one: write-back happens exactly when that comparison says the save step will
+ * not run, and a divergence would either double the work or skip the write-back entirely.
+ */
+function isExactMatch(restoredKey, primaryKey) {
+    return restoredKey.localeCompare(primaryKey, undefined, { sensitivity: "accent" }) === 0;
+}
+/**
  * Composes providers into a single cache, ordered nearest (cheapest) first.
  *
  * A layer that fails degrades to the next one, and never fails the run.
@@ -34415,7 +34423,9 @@ function createLayeredCache(providers, strategy) {
      *
      * This has to happen here rather than in `saveCache`: `restore.ts` only calls `config.saveState()`
      * when the restored key is not an exact match, and `save.ts` does nothing without that state, so
-     * an exact hit never reaches `saveCache` at all.
+     * an exact hit never reaches `saveCache` at all. By the same rule it is only ever called for an
+     * exact match — anything else is followed by a `saveCache` that writes every layer anyway, and
+     * writing twice would put a second full compression on the restore path.
      */
     async function writeBack(nearer, paths, key, options) {
         if (!nearer.length) {
@@ -34458,7 +34468,12 @@ function createLayeredCache(providers, strategy) {
                         continue;
                     }
                     info(`Cache layer "${provider.name}" served "${restoredKey}".`);
-                    await writeBack(providers.slice(0, index), paths, restoredKey, options);
+                    if (isExactMatch(restoredKey, primaryKey)) {
+                        await writeBack(providers.slice(0, index), paths, restoredKey, options);
+                    }
+                    else if (index > 0) {
+                        info(`Not writing "${restoredKey}" back: the save step writes every layer after a partial hit.`);
+                    }
                     return restoredKey;
                 }
             }
@@ -34597,12 +34612,17 @@ function createLocalCache(configuredDir) {
                 silent: true,
                 listeners: { stdout: memberMatcher(wanted, supplied) },
             });
+            if (wanted.length && !supplied.size) {
+                // Reported as a miss, not a hit: a hit here would be an exact-key match that delivered
+                // nothing, which stops a layered stack from consulting the next layer and stops the action
+                // from re-saving. Both leave the bad entry in place forever.
+                warning(`The local cache entry "${key}" holds none of the requested paths (${wanted.join(", ")});` +
+                    ` it was saved from a different layout and has been restored to its own recorded locations instead.` +
+                    ` Treating it as a miss.`);
+                return undefined;
+            }
             info(`Restored "${key}" from the local cache at ${cacheDir}` +
                 ` (${supplied.size}/${wanted.length} of the requested paths).`);
-            if (wanted.length && !supplied.size) {
-                warning(`The local cache entry "${key}" holds none of the requested paths (${wanted.join(", ")});` +
-                    ` it was saved from a different layout and has been restored to its own recorded locations instead.`);
-            }
             return key;
         },
         async saveCache(paths, key) {
@@ -34680,10 +34700,10 @@ async function getSingleCacheProvider(cacheProvider) {
     let cache;
     switch (cacheProvider) {
         case "github":
-            cache = await import('./cache-CmWO-TDy.js');
+            cache = await import('./cache-6EjHHdwn.js');
             break;
         case "warpbuild":
-            cache = await import('./cache-N8stTS3n.js').then(function (n) { return n.c; });
+            cache = await import('./cache-CAwbE-sh.js').then(function (n) { return n.c; });
             break;
         case "local": {
             const localPath = getInput("cache-local-path");

@@ -8,6 +8,7 @@ import { test, TestContext } from "node:test";
 import { promisify } from "node:util";
 
 import { createLocalCache } from "./localCache.js";
+import { warnings } from "./testHelpers.js";
 import { GhCache } from "./utils.js";
 
 const run = promisify(execFile);
@@ -46,22 +47,6 @@ async function writeTree(dir: string, files: Record<string, string>) {
 
 const KEY = "v1-rust-abcdef";
 const RESTORE_KEYS = ["v1-rust-"];
-
-/** The `::warning::` lines `@actions/core` emits while `body` runs. */
-async function warnings(body: () => Promise<unknown>): Promise<string[]> {
-  const written: string[] = [];
-  const original = process.stdout.write;
-  process.stdout.write = (chunk: any, ...rest: any[]) => {
-    written.push(String(chunk));
-    return original.call(process.stdout, chunk, ...(rest as [any, any]));
-  };
-  try {
-    await body();
-  } finally {
-    process.stdout.write = original;
-  }
-  return written.join("").split("\n").filter((line) => line.startsWith("::warning::"));
-}
 
 test("a save/restore round trip reproduces the tree", async (t) => {
   const { work, cache } = await sandbox(t);
@@ -235,7 +220,7 @@ test("concurrent saves of one key never expose a partial archive", async (t) => 
   }
 });
 
-test("restoring an entry that holds none of the requested paths warns", async (t) => {
+test("restoring an entry that holds none of the requested paths warns and reports a miss", async (t) => {
   const { work, cache } = await sandbox(t);
   const saved = path.join(work, "workspace-a", "target");
   const requested = path.join(work, "workspace-b", "target");
@@ -243,8 +228,14 @@ test("restoring an entry that holds none of the requested paths warns", async (t
   await cache.saveCache([saved], KEY);
 
   // Same key, different workspace layout: the cache key does not cover the cached paths.
-  const warned = await warnings(() => cache.restoreCache([requested], KEY, RESTORE_KEYS));
+  let restored: string | undefined = KEY;
+  const warned = await warnings(async () => {
+    restored = await cache.restoreCache([requested], KEY, RESTORE_KEYS);
+  });
 
+  // A hit here would be an exact-key match that delivered nothing: a layered stack would stop
+  // before the next layer, and `restore.ts` would see a full match and never re-save.
+  assert.equal(restored, undefined, "an entry that supplies none of the requested paths is a miss");
   assert.equal(warned.length, 1, `expected exactly one warning, got ${JSON.stringify(warned)}`);
   assert.match(warned[0]!, /holds none of the requested paths/);
   assert.match(warned[0]!, new RegExp(requested.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));

@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 
 import { createLayeredCache, LayerStrategy } from "./layeredCache.js";
+import { warnings } from "./testHelpers.js";
 import { CacheProvider, GhCache } from "./utils.js";
 
 type RestoreArgs = Parameters<GhCache["restoreCache"]>;
@@ -143,14 +144,26 @@ test("restoreCache writes a farther layer's hit back to every nearer layer", asy
   assert.equal(near.entries.has(KEY), true, "the nearer layer now holds the key");
 });
 
-test("write-back uses the key that was actually restored, not the requested one", async () => {
+test("a farther layer's partial hit is not written back: the save step writes every layer anyway", async () => {
   const [near, far] = [new FakeCache("near"), new FakeCache("far")];
   far.entries.set(OLDER_KEY, PATHS);
 
   const restored = await layered([near, far]).restoreCache(PATHS, KEY, RESTORE_KEYS);
 
   assert.equal(restored, OLDER_KEY);
-  assert.deepEqual(near.saveCalls, [[PATHS, OLDER_KEY]]);
+  assert.deepEqual(near.saveCalls, [], "writing the old key back would be a second full save of the same tree");
+});
+
+test("write-back uses the same exact-match test as restore.ts, not string equality", async () => {
+  const [near, far] = [new FakeCache("near"), new FakeCache("far")];
+  // `restore.ts` compares with `localeCompare(…, { sensitivity: "accent" })`, so a key differing
+  // only in case is a full match there and its save step never runs. Write-back must still fire.
+  far.restoreCache = async () => KEY.toUpperCase();
+
+  const restored = await layered([near, far]).restoreCache(PATHS, KEY, RESTORE_KEYS);
+
+  assert.equal(restored, KEY.toUpperCase());
+  assert.deepEqual(near.saveCalls, [[PATHS, KEY.toUpperCase()]]);
 });
 
 test("write-back is suppressed for a lookup-only restore", async () => {
@@ -163,12 +176,19 @@ test("write-back is suppressed for a lookup-only restore", async () => {
   assert.deepEqual(near.saveCalls, [], "nothing was downloaded, so there is nothing to write back");
 });
 
-test("write-back failure does not fail the restore", async () => {
+test("write-back failure does not fail the restore, and is warned about", async () => {
   const [near, far] = [new FakeCache("near"), new FakeCache("far")];
   near.failSave = true;
   far.entries.set(KEY, PATHS);
 
-  assert.equal(await layered([near, far]).restoreCache(PATHS, KEY, RESTORE_KEYS), KEY);
+  let restored: string | undefined;
+  const warned = await warnings(async () => {
+    restored = await layered([near, far]).restoreCache(PATHS, KEY, RESTORE_KEYS);
+  });
+
+  assert.equal(restored, KEY);
+  assert.equal(warned.length, 1, `expected exactly one warning, got ${JSON.stringify(warned)}`);
+  assert.match(warned[0]!, /"near" failed to store the write-back of "v1-rust-abcdef"/);
 });
 
 test("restoreCache forwards its options to every layer", async () => {
@@ -181,12 +201,23 @@ test("restoreCache forwards its options to every layer", async () => {
   assert.equal(far.restoreCalls[0]![3], options);
 });
 
-test("a layer whose restoreCache throws degrades to the next layer", async () => {
+test("a layer whose restoreCache throws degrades to the next layer, and says so", async () => {
   const [near, far] = [new FakeCache("near"), new FakeCache("far")];
   near.failRestore = true;
   far.entries.set(KEY, PATHS);
 
-  assert.equal(await layered([near, far]).restoreCache(PATHS, KEY, RESTORE_KEYS), KEY);
+  // Degrading is the one thing here that is allowed to be non-fatal, which makes the log line the
+  // only evidence it happened at all.
+  let restored: string | undefined;
+  const warned = await warnings(async () => {
+    restored = await layered([near, far]).restoreCache(PATHS, KEY, RESTORE_KEYS);
+  });
+
+  assert.equal(restored, KEY);
+  assert.ok(
+    warned.some((line) => /"near" failed to restore: Error: near: restore boom/.test(line)),
+    `expected a warning naming the failing layer, got ${JSON.stringify(warned)}`,
+  );
 });
 
 test("restoreCache resolves undefined when every layer throws", async () => {
@@ -207,12 +238,19 @@ test("saveCache writes to every layer and returns the first success", async () =
   assert.deepEqual(far.saveCalls, [[PATHS, KEY]]);
 });
 
-test("a layer whose saveCache throws does not stop the other layers", async () => {
+test("a layer whose saveCache throws does not stop the other layers, and is warned about", async () => {
   const [near, far] = [new FakeCache("near"), new FakeCache("far")];
   near.failSave = true;
 
-  assert.equal(await layered([near, far]).saveCache(PATHS, KEY), 1);
+  let result: string | number | undefined;
+  const warned = await warnings(async () => {
+    result = await layered([near, far]).saveCache(PATHS, KEY);
+  });
+
+  assert.equal(result, 1);
   assert.equal(far.entries.has(KEY), true);
+  assert.equal(warned.length, 1, `expected exactly one warning, got ${JSON.stringify(warned)}`);
+  assert.match(warned[0]!, /"near" failed to save "v1-rust-abcdef"/);
 });
 
 test("saveCache resolves -1 when every layer fails", async () => {
@@ -286,7 +324,9 @@ test("write matrix: nearest miss then a farther partial hit writes both layers",
   far.entries.set(OLDER_KEY, PATHS);
 
   assert.equal(await runAction(layered([near, far])), OLDER_KEY);
-  assert.deepEqual(near.saveCalls.map(([, key]) => key), [OLDER_KEY, KEY], "write-back, then the save");
+  // Once each, from the save step. A write-back of the partial hit would compress the same tree a
+  // second time, on the restore path, and store it under a key the save is about to supersede.
+  assert.deepEqual(near.saveCalls.map(([, key]) => key), [KEY]);
   assert.deepEqual(far.saveCalls.map(([, key]) => key), [KEY]);
 });
 

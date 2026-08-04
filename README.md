@@ -263,9 +263,12 @@ Limitations, all deliberate:
 - **Archives record absolute paths.** The cache key does not cover the workspace
   layout, so if `workspaces` changes while the key does not, an entry can
   restore to the paths it was saved from rather than the ones being asked for.
-  The provider warns when none of the requested paths appear in the archive; the
-  remedy is to vary `prefix-key` or `shared-key` so the layouts get separate
-  keys.
+  When none of the requested paths appear in the archive the provider warns and
+  reports a **miss**, so a stack falls through to the next layer and a single
+  layer rebuilds and re-saves under the same key. The files the archive did
+  contain have already been written to the locations it recorded, and are left
+  there. The remedy is to vary `prefix-key` or `shared-key` so the two layouts
+  get separate keys.
 
 ### Lookup strategies
 
@@ -298,8 +301,8 @@ assumption about the backend rather than something this action can enforce.
 | Nearest miss, farther layer **partial** hit | yes — on save | yes — on save |
 | Miss at every layer | yes — on save | yes — on save |
 
-When a farther layer serves a hit, the nearer layers are populated from it
-before the restore returns. That write-back happens during the action's
+When a farther layer serves an **exact** hit, the nearer layers are populated
+from it before the restore returns. That write-back happens during the action's
 **restore** step and not its **save** step, which is not an implementation
 detail: `src/restore.ts` only calls `config.saveState()` when the restored key
 is *not* an exact match, and `src/save.ts` returns early when that state is
@@ -312,7 +315,15 @@ back: a farther-layer hit leaves the nearer layers exactly as they were.
 
 The two rows that save to every layer fall out of that same rule: the save step
 is only reached when the exact key was absent from every layer, so there is
-nothing to decide and no bookkeeping about which layer hit.
+nothing to decide and no bookkeeping about which layer hit. It is also why a
+**partial** hit is deliberately *not* written back — the save step is guaranteed
+to follow and to write every layer, and writing back as well would compress and
+store the same tree twice, the second time on the restore path this feature
+exists to shorten. The trade-off: with `save-if: false` and a partial hit, the
+nearer layers keep nothing, but what they would have kept is a stale entry.
+
+Whether a hit counts as exact is decided with the same comparison `restore.ts`
+makes, so the two can never disagree about which step does the writing.
 
 ### Failures
 
