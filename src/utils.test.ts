@@ -12,3 +12,7 @@ test("exists returns true for a path that exists", async () => {
 test("exists returns false for a path that does not exist", async () => {
   assert.equal(await exists(`${thisFile}.does-not-exist`), false);
 });
+
+test("DELIBERATE FAILURE: proves the CI gate bites", async () => {
+  assert.equal(await exists(thisFile), false);
+});
