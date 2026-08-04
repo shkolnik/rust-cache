@@ -38,12 +38,14 @@ jobs:
   #
   # One more piece of the same puzzle: on a cache miss, `src/restore.ts` calls `config.saveState()`
   # so that `src/save.ts`'s `post` step knows there's something to save (`isCacheUpToDate()` reads
-  # it back). The runner only turns a step's `$GITHUB_STATE` into a `STATE_*` env var for *that
-  # step's own* automatic `post`, not for later plain `run:` steps in the job -- confirmed by
-  # running this without the bridge below, where `dist/save.js` saw no state and logged
-  # "Cache up-to-date." and wrote nothing. `$GITHUB_STATE` is one file for the whole job, so the
-  # fix is to read back what `dist/restore.js` wrote to it and re-emit it as a normal env var via
-  # `$GITHUB_ENV`, which *is* documented to propagate to every later step in the job.
+  # it back). `$GITHUB_STATE`, like `$GITHUB_OUTPUT`, is a fresh file *per step*; a later step's
+  # copy of that env var points at a different, empty file, so `core.getState()` there sees
+  # nothing -- confirmed in CI: without the in-step bridge below, `dist/save.js` logged
+  # "Cache up-to-date." and wrote nothing, and the immediately-preceding `dist/restore.js` step
+  # had definitely called `saveState()` (its own log showed the cold-miss branch). The fix reads
+  # `$GITHUB_STATE` back within the *same* restore step, right after `dist/restore.js` runs and
+  # while that file is still the one it wrote to, and re-emits the value via `$GITHUB_ENV`, which
+  # *is* documented to propagate to every later step in the job.
   local-save:
     if: github.repository == 'Swatinem/rust-cache' || github.repository == 'shkolnik/rust-cache'
     name: Save to a cold local cache
@@ -79,22 +81,18 @@ jobs:
         with:
           node-version: 24.x
 
+      # $GITHUB_STATE (like $GITHUB_OUTPUT/$GITHUB_ENV) is a fresh, step-scoped file: the runner
+      # only turns *this* step's copy into a STATE_* env var for *this step's own* automatic
+      # post, never for a later plain `run:` step. A later step reading $GITHUB_STATE gets an
+      # empty file, not this step's -- confirmed by observing exactly that in CI. So the bridge
+      # from core.saveState() to core.getState() has to happen inside this same step, immediately
+      # after dist/restore.js, while $GITHUB_STATE still holds what it just wrote. It re-emits
+      # that value via $GITHUB_ENV, which -- unlike $GITHUB_STATE -- *is* documented to propagate
+      # to every later step in the job, so the save step below can pick it up.
       - name: "Restore (expected: cold miss)"
         id: restore
-        run: node dist/restore.js
-
-      - name: Verify cold miss
-        if: steps.restore.outputs.cache-hit == 'true'
         run: |
-          echo "Expected a cold miss on a freshly created local cache path, but got a hit." >&2
-          exit 1
-
-      - run: cargo check
-        working-directory: tests
-
-      # Bridge core.saveState()/getState() across steps manually -- see the note above the job.
-      - name: Bridge the restore step's saved state to the save step
-        run: |
+          node dist/restore.js
           node -e '
             const fs = require("fs");
             const content = fs.readFileSync(process.env.GITHUB_STATE, "utf8");
@@ -105,8 +103,17 @@ jobs:
             }
             const delim = "ghadelimiter_bridge_" + Date.now();
             fs.appendFileSync(process.env.GITHUB_ENV, `STATE_RUST_CACHE_CONFIG<<${delim}\n${match[2]}\n${delim}\n`);
-            console.log("Bridged RUST_CACHE_CONFIG state to the save step.");
+            console.log("Bridged RUST_CACHE_CONFIG state to later steps.");
           '
+
+      - name: Verify cold miss
+        if: steps.restore.outputs.cache-hit == 'true'
+        run: |
+          echo "Expected a cold miss on a freshly created local cache path, but got a hit." >&2
+          exit 1
+
+      - run: cargo check
+        working-directory: tests
 
       # Drive the save explicitly, at the point in the job where we want the archive to exist,
       # rather than relying on the automatic post step (see the ordering note above the job).
