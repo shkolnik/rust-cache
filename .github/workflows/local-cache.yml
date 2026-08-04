@@ -81,6 +81,11 @@ jobs:
         with:
           node-version: 24.x
 
+      # Make the cold-miss precondition explicit rather than resting solely on the run-id in the
+      # key: this path is a fixed /tmp location, not pruned between runs on a reused runner.
+      - name: Ensure a cold local cache path
+        run: rm -rf /tmp/rust-cache-local
+
       # $GITHUB_STATE (like $GITHUB_OUTPUT/$GITHUB_ENV) is a fresh, step-scoped file: the runner
       # only turns *this* step's copy into a STATE_* env var for *this step's own* automatic
       # post, never for a later plain `run:` step. A later step reading $GITHUB_STATE gets an
@@ -89,6 +94,8 @@ jobs:
       # after dist/restore.js, while $GITHUB_STATE still holds what it just wrote. It re-emits
       # that value via $GITHUB_ENV, which -- unlike $GITHUB_STATE -- *is* documented to propagate
       # to every later step in the job, so the save step below can pick it up.
+      # scaffolding: STATE_RUST_CACHE_CONFIG is left in $GITHUB_ENV for the rest of this job's
+      # steps; harmless here (no later step depends on its absence) but not cleaned up.
       - name: "Restore (expected: cold miss)"
         id: restore
         run: |
@@ -130,6 +137,12 @@ jobs:
           if-no-files-found: error
           retention-days: 1
 
+  # Unlike local-save, this job has nothing after the restore that needs to happen before an
+  # automatic post step, so the post-step ordering constraint above does not apply here: this is a
+  # plain `uses: ./` restore, exactly like `save-restore.yml`'s restore job. Going through the real
+  # action invocation (rather than driving dist/restore.js by hand, as local-save must) is what
+  # exercises action.yml's input defaulting and the runner's own INPUT_* marshalling for
+  # `cache-provider: local` on the hit path -- the scenario local-save's manual driving can't cover.
   local-restore:
     if: github.repository == 'Swatinem/rust-cache' || github.repository == 'shkolnik/rust-cache'
     name: Restore the warmed local cache
@@ -138,22 +151,6 @@ jobs:
 
     env:
       CARGO_TERM_COLOR: always
-      INPUT_WORKSPACES: tests
-      INPUT_PREFIX-KEY: v0-rust
-      INPUT_SHARED-KEY: local-cache-${{ github.run_id }}-${{ github.run_attempt }}
-      INPUT_ADD-JOB-ID-KEY: "true"
-      INPUT_ADD-RUST-ENVIRONMENT-HASH-KEY: "true"
-      INPUT_CACHE-TARGETS: "true"
-      INPUT_CACHE-ON-FAILURE: "false"
-      INPUT_CACHE-ALL-CRATES: "false"
-      INPUT_CACHE-WORKSPACE-CRATES: "false"
-      INPUT_SAVE-IF: "false"
-      INPUT_CACHE-PROVIDER: local
-      INPUT_CACHE-LOCAL-PATH: /tmp/rust-cache-local
-      INPUT_CACHE-LAYER-STRATEGY: exact-first
-      INPUT_CACHE-BIN: "true"
-      INPUT_LOOKUP-ONLY: "false"
-      INPUT_CMD-FORMAT: "{0}"
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -162,18 +159,19 @@ jobs:
 
       - run: rustup toolchain install stable --profile minimal --no-self-update
 
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
-        with:
-          node-version: 24.x
-
       - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
         with:
           name: local-cache-${{ github.run_id }}-${{ github.run_attempt }}
           path: /tmp/rust-cache-local
 
-      - name: "Restore (expected: warm hit)"
-        id: cache
-        run: node dist/restore.js
+      - id: cache
+        uses: ./
+        with:
+          workspaces: tests
+          cache-provider: local
+          cache-local-path: /tmp/rust-cache-local
+          shared-key: local-cache-${{ github.run_id }}-${{ github.run_attempt }}
+          save-if: "false"
 
       - name: Verify exact cache hit
         if: steps.cache.outputs.cache-hit != 'true'
@@ -225,6 +223,11 @@ jobs:
           persist-credentials: false
 
       - run: rustup toolchain install stable --profile minimal --no-self-update
+
+      # Make the cold-miss precondition explicit rather than resting solely on the run-id in the
+      # key: this path is a fixed /tmp location, not pruned between runs on a reused runner.
+      - name: Ensure a cold local cache path
+        run: rm -rf /tmp/rust-cache-writeback
 
       - id: cache
         uses: ./
