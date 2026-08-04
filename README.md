@@ -307,6 +307,9 @@ empty. On an exact hit the save step therefore never runs at all, and a
 write-back placed there would never fire — silently, with a working cache that
 simply never got faster.
 
+With `lookup-only: true` nothing is downloaded, so there is nothing to write
+back: a farther-layer hit leaves the nearer layers exactly as they were.
+
 The two rows that save to every layer fall out of that same rule: the save step
 is only reached when the exact key was absent from every layer, so there is
 nothing to decide and no bookkeeping about which layer hit.
@@ -319,8 +322,13 @@ failures as non-fatal, and a stack of providers is not stricter than the
 provider it wraps. A write-back that fails is warned about and otherwise
 ignored. The cache is considered available if any layer is available.
 
-Naming a provider that does not exist is still a hard error, as is
-`cache-provider: local` without a `cache-local-path`.
+Configuration mistakes — naming a provider that does not exist, `local` without
+a `cache-local-path`, or a `cache-layer-strategy` that is neither `exact-first`
+nor `nearest-first` — are reported as an error annotation and disable caching
+for the whole run. They do not fail the step: the provider stack is built
+outside the action's error handling, so the error reaches the top-level
+`uncaughtException` handler, which logs it and lets the process exit 0. If a job
+that should be cached is not, that error in the log is where to look.
 
 ## Debugging
 
