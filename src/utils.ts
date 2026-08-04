@@ -2,6 +2,9 @@ import * as core from "@actions/core";
 import * as exec from "@actions/exec";
 import fs from "fs";
 
+import { createLayeredCache, LayerStrategy } from "./layeredCache.js";
+import { createLocalCache } from "./localCache.js";
+
 export function reportError(e: any) {
   const { commandFailed } = e;
   if (commandFailed) {
@@ -50,8 +53,7 @@ export interface CacheProvider {
   cache: GhCache;
 }
 
-export async function getCacheProvider(): Promise<CacheProvider> {
-  const cacheProvider = core.getInput("cache-provider");
+async function getSingleCacheProvider(cacheProvider: string): Promise<CacheProvider> {
   let cache: GhCache;
   switch (cacheProvider) {
     case "github":
@@ -60,6 +62,14 @@ export async function getCacheProvider(): Promise<CacheProvider> {
     case "warpbuild":
       cache = await import("@actions/warpbuild-cache");
       break;
+    case "local": {
+      const localPath = core.getInput("cache-local-path");
+      if (!localPath) {
+        throw new Error("The `local` `cache-provider` requires a `cache-local-path`.");
+      }
+      cache = createLocalCache(localPath);
+      break;
+    }
     default:
       throw new Error(`The \`cache-provider\` \`${cacheProvider}\` is not valid.`);
   }
@@ -67,6 +77,39 @@ export async function getCacheProvider(): Promise<CacheProvider> {
   return {
     name: cacheProvider,
     cache: cache,
+  };
+}
+
+function getLayerStrategy(): LayerStrategy {
+  const strategy = core.getInput("cache-layer-strategy") || "exact-first";
+  if (strategy !== "exact-first" && strategy !== "nearest-first") {
+    throw new Error(
+      `The \`cache-layer-strategy\` \`${strategy}\` is not valid. Use \`exact-first\` or \`nearest-first\`.`,
+    );
+  }
+  return strategy;
+}
+
+export async function getCacheProvider(): Promise<CacheProvider> {
+  const input = core.getInput("cache-provider");
+  const names = input.split(",").map((name) => name.trim());
+  if (names.some((name) => !name)) {
+    throw new Error(`The \`cache-provider\` \`${input}\` is not valid: it has an empty entry.`);
+  }
+  const strategy = getLayerStrategy();
+
+  const providers: CacheProvider[] = [];
+  for (const name of names) {
+    providers.push(await getSingleCacheProvider(name));
+  }
+  // A single provider is used as-is: no wrapper, and nothing an existing user can observe.
+  if (providers.length === 1) {
+    return providers[0];
+  }
+
+  return {
+    name: names.join(","),
+    cache: createLayeredCache(providers, strategy),
   };
 }
 

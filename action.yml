@@ -49,9 +49,16 @@ inputs:
     required: false
     default: "true"
   cache-provider:
-    description: "Determines which provider to use for caching. Options are github, or warpbuild. Defaults to github."
+    description: "Determines which provider to use for caching. Options are github, warpbuild, or local. Several comma-separated providers, nearest first, are layered into a single cache. Defaults to github."
     required: false
     default: "github"
+  cache-local-path:
+    description: "The directory the `local` cache provider stores its entries in. Required by that provider."
+    required: false
+  cache-layer-strategy:
+    description: "How several layered cache providers are searched. `exact-first` asks every layer for the exact key before any layer is asked for a prefix match, `nearest-first` asks each layer for both at once. Defaults to exact-first."
+    required: false
+    default: "exact-first"
   cache-bin:
     description: "Determines whether to cache ${CARGO_HOME}/bin."
     required: false
