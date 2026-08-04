@@ -53,7 +53,7 @@ jobs:
       INPUT_CACHE-WORKSPACE-CRATES: "false"
       INPUT_SAVE-IF: "true"
       INPUT_CACHE-PROVIDER: local
-      INPUT_CACHE-LOCAL-PATH: ${{ runner.temp }}/rust-cache-local
+      INPUT_CACHE-LOCAL-PATH: /tmp/rust-cache-local
       INPUT_CACHE-LAYER-STRATEGY: exact-first
       INPUT_CACHE-BIN: "true"
       INPUT_LOOKUP-ONLY: "false"
@@ -89,12 +89,12 @@ jobs:
         run: node dist/save.js
 
       - name: Show the archive that was just written
-        run: ls -la "${{ runner.temp }}/rust-cache-local"
+        run: ls -la "/tmp/rust-cache-local"
 
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: local-cache-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ${{ runner.temp }}/rust-cache-local
+          path: /tmp/rust-cache-local
           if-no-files-found: error
           retention-days: 1
 
@@ -117,7 +117,7 @@ jobs:
       INPUT_CACHE-WORKSPACE-CRATES: "false"
       INPUT_SAVE-IF: "false"
       INPUT_CACHE-PROVIDER: local
-      INPUT_CACHE-LOCAL-PATH: ${{ runner.temp }}/rust-cache-local
+      INPUT_CACHE-LOCAL-PATH: /tmp/rust-cache-local
       INPUT_CACHE-LAYER-STRATEGY: exact-first
       INPUT_CACHE-BIN: "true"
       INPUT_LOOKUP-ONLY: "false"
@@ -137,7 +137,7 @@ jobs:
       - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
         with:
           name: local-cache-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ${{ runner.temp }}/rust-cache-local
+          path: /tmp/rust-cache-local
 
       - name: "Restore (expected: warm hit)"
         id: cache
@@ -199,7 +199,7 @@ jobs:
         with:
           workspaces: tests
           cache-provider: local,github
-          cache-local-path: ${{ runner.temp }}/rust-cache-writeback
+          cache-local-path: /tmp/rust-cache-writeback
           cache-layer-strategy: exact-first
           shared-key: writeback-${{ github.run_id }}-${{ github.run_attempt }}
           save-if: "false"
@@ -212,7 +212,7 @@ jobs:
 
       - name: Verify write-back populated the nearer, previously cold local layer
         run: |
-          dir="${{ runner.temp }}/rust-cache-writeback"
+          dir="/tmp/rust-cache-writeback"
           ls -la "$dir"
           count=$(find "$dir" -maxdepth 1 -name '*.tar.zst' | wc -l)
           if [ "$count" -lt 1 ]; then
