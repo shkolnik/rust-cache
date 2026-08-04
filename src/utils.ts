@@ -3,7 +3,6 @@ import * as exec from "@actions/exec";
 import fs from "fs";
 
 export function reportError(e: any) {
-  // deliberate stale-dist probe for Task 1 (reverted immediately after)
   const { commandFailed } = e;
   if (commandFailed) {
     core.error(`Command failed: ${commandFailed.command}`);
