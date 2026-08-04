@@ -49,7 +49,7 @@
     "clean": "node -e \"(async () => { try { await require('fs/promises').rm('dist', { recursive: true }); } catch {} })()\"",
     "prebuild": "npm run clean",
     "build": "tsc && rollup --config .build/rollup.config.js",
-    "test": "tsc && node --test $(find .build/src -name '*.test.js')",
+    "test": "tsc && FILES=$(find .build/src -name '*.test.js'); [ -n \"$FILES\" ] || { echo 'no test files found under .build/src' >&2; exit 1; }; node --test $FILES",
     "prepublishOnly": "npm run test",
     "prepare": "npm run build && linefix dist"
   }
