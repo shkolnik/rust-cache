@@ -35,6 +35,15 @@ jobs:
   # through `uses: ./`. That gives it full control of the sequence: restore, build, save, *then*
   # upload -- all as ordinary steps in one job. The action's inputs are supplied as `INPUT_*`
   # env vars, the same convention the runner itself uses for a `uses:` step.
+  #
+  # One more piece of the same puzzle: on a cache miss, `src/restore.ts` calls `config.saveState()`
+  # so that `src/save.ts`'s `post` step knows there's something to save (`isCacheUpToDate()` reads
+  # it back). The runner only turns a step's `$GITHUB_STATE` into a `STATE_*` env var for *that
+  # step's own* automatic `post`, not for later plain `run:` steps in the job -- confirmed by
+  # running this without the bridge below, where `dist/save.js` saw no state and logged
+  # "Cache up-to-date." and wrote nothing. `$GITHUB_STATE` is one file for the whole job, so the
+  # fix is to read back what `dist/restore.js` wrote to it and re-emit it as a normal env var via
+  # `$GITHUB_ENV`, which *is* documented to propagate to every later step in the job.
   local-save:
     if: github.repository == 'Swatinem/rust-cache' || github.repository == 'shkolnik/rust-cache'
     name: Save to a cold local cache
@@ -82,6 +91,22 @@ jobs:
 
       - run: cargo check
         working-directory: tests
+
+      # Bridge core.saveState()/getState() across steps manually -- see the note above the job.
+      - name: Bridge the restore step's saved state to the save step
+        run: |
+          node -e '
+            const fs = require("fs");
+            const content = fs.readFileSync(process.env.GITHUB_STATE, "utf8");
+            const match = content.match(/^RUST_CACHE_CONFIG<<(\S+)\r?\n([\s\S]*?)\r?\n\1\r?\n?/m);
+            if (!match) {
+              console.log("No RUST_CACHE_CONFIG state was saved by the restore step; nothing to bridge.");
+              process.exit(0);
+            }
+            const delim = "ghadelimiter_bridge_" + Date.now();
+            fs.appendFileSync(process.env.GITHUB_ENV, `STATE_RUST_CACHE_CONFIG<<${delim}\n${match[2]}\n${delim}\n`);
+            console.log("Bridged RUST_CACHE_CONFIG state to the save step.");
+          '
 
       # Drive the save explicitly, at the point in the job where we want the archive to exist,
       # rather than relying on the automatic post step (see the ordering note above the job).
