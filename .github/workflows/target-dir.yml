@@ -6,7 +6,7 @@ permissions: {}
 
 jobs:
   target-dir:
-    if: github.repository == 'Swatinem/rust-cache'
+    if: github.repository == 'Swatinem/rust-cache' || github.repository == 'shkolnik/rust-cache'
     strategy:
       fail-fast: false
       matrix:
