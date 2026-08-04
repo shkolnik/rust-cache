@@ -47,6 +47,22 @@ async function writeTree(dir: string, files: Record<string, string>) {
 const KEY = "v1-rust-abcdef";
 const RESTORE_KEYS = ["v1-rust-"];
 
+/** The `::warning::` lines `@actions/core` emits while `body` runs. */
+async function warnings(body: () => Promise<unknown>): Promise<string[]> {
+  const written: string[] = [];
+  const original = process.stdout.write;
+  process.stdout.write = (chunk: any, ...rest: any[]) => {
+    written.push(String(chunk));
+    return original.call(process.stdout, chunk, ...(rest as [any, any]));
+  };
+  try {
+    await body();
+  } finally {
+    process.stdout.write = original;
+  }
+  return written.join("").split("\n").filter((line) => line.startsWith("::warning::"));
+}
+
 test("a save/restore round trip reproduces the tree", async (t) => {
   const { work, cache } = await sandbox(t);
   const tree = path.join(work, "target");
@@ -217,6 +233,65 @@ test("concurrent saves of one key never expose a partial archive", async (t) => 
     );
     assert.equal(members, expectedMembers, `archive ${digest.slice(0, 12)} (${bytes.length} bytes) is not intact`);
   }
+});
+
+test("restoring an entry that holds none of the requested paths warns", async (t) => {
+  const { work, cache } = await sandbox(t);
+  const saved = path.join(work, "workspace-a", "target");
+  const requested = path.join(work, "workspace-b", "target");
+  await writeTree(saved, { "a.txt": "a" });
+  await cache.saveCache([saved], KEY);
+
+  // Same key, different workspace layout: the cache key does not cover the cached paths.
+  const warned = await warnings(() => cache.restoreCache([requested], KEY, RESTORE_KEYS));
+
+  assert.equal(warned.length, 1, `expected exactly one warning, got ${JSON.stringify(warned)}`);
+  assert.match(warned[0]!, /holds none of the requested paths/);
+  assert.match(warned[0]!, new RegExp(requested.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+  assert.equal(fs.existsSync(requested), false, "the requested path was never populated");
+  assert.equal(fs.existsSync(saved), true, "the archive restored to its own recorded location");
+});
+
+test("restoring an entry that holds the requested paths does not warn", async (t) => {
+  const { work, cache } = await sandbox(t);
+  const tree = path.join(work, "target");
+  await writeTree(tree, { "nested/a.txt": "a", "b.txt": "b" });
+  await cache.saveCache([tree], KEY);
+  await fs.promises.rm(tree, { recursive: true });
+
+  // A relative path, to pin that the member check resolves before comparing.
+  const warned = await warnings(() => cache.restoreCache([path.relative(process.cwd(), tree)], KEY, RESTORE_KEYS));
+
+  assert.deepEqual(warned, []);
+  assert.equal(fs.existsSync(path.join(tree, "nested/a.txt")), true);
+});
+
+test("an empty cache directory is rejected instead of resolving against the cwd", async (t) => {
+  const { work } = await sandbox(t);
+  const tree = path.join(work, "target");
+  await writeTree(tree, { "a.txt": "a" });
+  const cache = createLocalCache("  ");
+
+  assert.equal(cache.isFeatureAvailable(), false);
+  await assert.rejects(() => cache.saveCache([tree], KEY), /`cache-local-path` is empty/);
+  await assert.rejects(() => cache.restoreCache([tree], KEY, RESTORE_KEYS), /`cache-local-path` is empty/);
+  assert.equal(fs.existsSync(path.join(process.cwd(), `${KEY}.tar.zst`)), false, "nothing may land in the cwd");
+});
+
+test("a relative cache directory is resolved once, at construction", async (t) => {
+  const { root, work } = await sandbox(t);
+  const tree = path.join(work, "target");
+  await writeTree(tree, { "a.txt": "a" });
+
+  const cwd = process.cwd();
+  process.chdir(root);
+  t.after(() => process.chdir(cwd));
+  const cache = createLocalCache("relative-cache");
+
+  await cache.saveCache([tree], KEY);
+  process.chdir(cwd); // The entry must not follow the cwd around.
+  assert.equal(fs.existsSync(path.join(root, "relative-cache", `${KEY}.tar.zst`)), true);
+  assert.equal(await cache.restoreCache([tree], KEY, RESTORE_KEYS), KEY);
 });
 
 test("saveCache leaves no temp files behind", async (t) => {

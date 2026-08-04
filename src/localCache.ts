@@ -10,16 +10,46 @@ import { exists, GhCache } from "./utils.js";
 const SUFFIX = ".tar.zst";
 
 /**
+ * Consumes `tar -v`'s member listing chunk by chunk, recording which of `wanted` the archive
+ * actually supplies. Streamed rather than collected: an entry can hold a million members.
+ */
+function memberMatcher(wanted: string[], supplied: Set<string>): (chunk: Buffer) => void {
+  let tail = "";
+  return (chunk) => {
+    if (supplied.size === wanted.length) {
+      return;
+    }
+    const lines = (tail + chunk.toString()).split("\n");
+    // tar terminates every member with a newline, so the remainder is always an incomplete line.
+    tail = lines.pop() ?? "";
+    for (const line of lines) {
+      const member = line.replace(/\/+$/, "");
+      for (const root of wanted) {
+        if (member === root || member.startsWith(root + path.sep)) {
+          supplied.add(root);
+        }
+      }
+    }
+  };
+}
+
+/**
  * A filesystem cache, one entry per key at `<cacheDir>/<key>.tar.zst`.
  *
  * It knows nothing about other caches or about layering; compose it with `createLayeredCache`.
  */
-export function createLocalCache(cacheDir: string): GhCache {
+export function createLocalCache(configuredDir: string): GhCache {
+  // Resolved once, so no entry can ever land somewhere that depends on the process's cwd.
+  const cacheDir = configuredDir.trim() ? path.resolve(configuredDir.trim()) : "";
+
   /**
    * The archive holds absolute member names (`tar -P`), so entries restore in place and a key
    * is only ever a file name, never a path.
    */
   function entryPath(key: string): string {
+    if (!cacheDir) {
+      throw new Error("The local cache has no directory: `cache-local-path` is empty.");
+    }
     if (!key || key.includes("/") || key.includes("\\") || key.includes("..")) {
       throw new Error(`The cache key \`${key}\` cannot be used as a local cache file name.`);
     }
@@ -65,7 +95,7 @@ export function createLocalCache(cacheDir: string): GhCache {
 
   return {
     isFeatureAvailable() {
-      if (!cacheDir.trim()) {
+      if (!cacheDir) {
         core.warning("The local cache is unavailable: no `cache-local-path` was configured.");
         return false;
       }
@@ -79,7 +109,7 @@ export function createLocalCache(cacheDir: string): GhCache {
       }
     },
 
-    async restoreCache(_paths, primaryKey, restoreKeys = [], options) {
+    async restoreCache(paths, primaryKey, restoreKeys = [], options) {
       await ensureTools();
 
       const key = await findKey(primaryKey, restoreKeys);
@@ -92,8 +122,26 @@ export function createLocalCache(cacheDir: string): GhCache {
         return key;
       }
 
-      await exec.exec("tar", ["-P", "--use-compress-program=zstd -d", "-xf", entryPath(key)]);
-      core.info(`Restored "${key}" from the local cache at ${cacheDir}.`);
+      // The archive's absolute member names decide where the entry lands, so a caller's `paths` can
+      // only be checked, never applied. The cache key does not cover the workspace layout, so an
+      // entry saved from different paths is a real possibility and must not restore in silence.
+      const wanted = [...new Set(paths.map((p) => path.resolve(p)))];
+      const supplied = new Set<string>();
+      await exec.exec("tar", ["-P", "--use-compress-program=zstd -d", "-xvf", entryPath(key)], {
+        silent: true,
+        listeners: { stdout: memberMatcher(wanted, supplied) },
+      });
+
+      core.info(
+        `Restored "${key}" from the local cache at ${cacheDir}` +
+          ` (${supplied.size}/${wanted.length} of the requested paths).`,
+      );
+      if (wanted.length && !supplied.size) {
+        core.warning(
+          `The local cache entry "${key}" holds none of the requested paths (${wanted.join(", ")});` +
+            ` it was saved from a different layout and has been restored to its own recorded locations instead.`,
+        );
+      }
       return key;
     },
 
