@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+- Add the `local` cache provider and layered (`local,github`) provider stacks, with the
+  `cache-local-path` and `cache-layer-strategy` inputs.
+- **`CARGO_HOME` is no longer hashed into the cache key.** It names a location rather than a build
+  input, and hashing it stopped two machines with different cargo homes from ever sharing an entry.
+  Anyone who exports `CARGO_HOME` will see one cache miss as their key changes; every other
+  `CARGO*` variable still contributes as before.
+
 ## 2.9.1
 
 - Fix regression in hash calculation

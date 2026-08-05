@@ -92,9 +92,24 @@ sensible defaults.
     lookup-only: ""
 
     # Specifies what to use as the backend providing cache
-    # Can be set to "github", or "warpbuild"
+    # Can be set to "github", "warpbuild", or "local".
+    # Several comma-separated providers, nearest first, are layered into a
+    # single cache, see the "Layered caching" section below.
     # default: "github"
     cache-provider: ""
+    # To check a local disk before going to the GitHub cache service:
+    cache-provider: local,github
+
+    # The directory the `local` cache provider stores its entries in.
+    # Required by that provider, and unused by the others.
+    # default: empty
+    cache-local-path: ""
+
+    # How several layered cache providers are searched.
+    # Can be set to "exact-first" or "nearest-first", and has no effect
+    # unless `cache-provider` names more than one provider.
+    # default: "exact-first"
+    cache-layer-strategy: ""
 
     # Determines whether to cache the ~/.cargo/bin directory.
     # default: "true"
@@ -195,6 +210,174 @@ branches.
 
 The caches can be controlled using the [Cache API](https://docs.github.com/en/rest/actions/cache)
 which allows listing existing caches and manually removing entries.
+
+## Layered caching
+
+`cache-provider` accepts a comma-separated stack of providers, ordered nearest
+(cheapest) first. With more than one entry the action layers them into a single
+cache: a restore falls through the stack until some layer answers, and a save
+writes to every layer. A single `cache-provider` value is used unwrapped, and
+behaves exactly as it did before layering existed.
+
+The motivating case is a self-hosted runner. Every job restores the same cargo
+cache over the WAN, and with `add-job-id-key` (the default) each job has its own
+entry, so a ten-job workflow pulls the whole payload ten times onto a host that
+already had those bytes minutes earlier. Putting a `local` layer in front means
+the network is only used when the disk cannot answer.
+
+```yaml
+- uses: Swatinem/rust-cache@v2
+  with:
+    cache-provider: local,github
+    cache-local-path: /mnt/gha-cache/rust
+    cache-layer-strategy: exact-first
+```
+
+`cache-local-path` must be a directory the job can write to, and must survive
+between jobs for the layer to be worth anything — a path on the runner host, not
+one inside a per-job container or workspace. It is created if it does not exist.
+
+### The `local` provider
+
+An entry is a **directory**, `<cache-local-path>/<key>/`, holding one archive per
+*root*:
+
+```
+<cache-local-path>/v0-rust-.../
+  cargo.tar.zst        # members relative to CARGO_HOME
+  workspace.tar.zst    # members relative to GITHUB_WORKSPACE
+  home.tar.zst         # members relative to HOME
+  abs-%2Fopt%2Fx.tar.zst   # members relative to /opt, restored to /opt
+```
+
+Each archive records member names *relative* to its root, and is extracted under
+whatever that root is on the restoring machine. Entries therefore **relocate**: a
+runner whose `CARGO_HOME` differs from the one that saved the entry still
+restores it to the right place. This matters because the cache key covers the OS,
+architecture, rustc version and lockfile hashes but never the workspace layout,
+so two machines sharing one `cache-local-path` — over NFS, say — compute the same
+key with different roots. `CARGO_HOME` is deliberately excluded from the key for
+this reason: it names a location, not a build input, and hashing it would stop
+those two machines from ever computing the same key in the first place.
+
+A path that sits under none of those roots gets an `abs-` archive named after its
+percent-encoded absolute path, and restores to that exact location. Those entries
+are **not** relocatable; the filename makes that visible rather than silent.
+
+The entry is built in a temporary directory and `rename()`d into place, so a
+reader sees either a complete entry or none. **The first writer wins:** if the key
+already exists the new entry is discarded and the existing one kept. Two jobs
+racing on one key therefore cannot corrupt it.
+
+A restore looks for the exact key first, then for each restore key as a directory
+name prefix, preferring the most recently written match.
+
+Requirements:
+
+- **GNU tar and zstd on `PATH`.** Linux and macOS runners have them (macOS uses
+  `gtar` if present, otherwise stock BSD tar). On **Windows** the provider uses
+  Git for Windows' GNU tar at `%PROGRAMFILES%\Git\usr\bin\tar.exe`; Windows
+  *without* Git for Windows is unsupported and fails with an explicit error
+  rather than degrading silently. The tooling is probed up front, so a host that
+  lacks it reports the provider as unavailable once instead of failing every
+  restore and save.
+
+Limitations, all deliberate:
+
+- **There is no eviction and no size limit.** The directory grows without bound;
+  pruning it is the operator's job. A saver killed mid-write can leave a
+  dot-prefixed `.tmp` directory behind. Lookups ignore those, but they accumulate.
+- **A corrupt entry is sticky.** Because the first writer wins, re-running the job
+  will not replace a bad entry — delete it by hand. This is the price of never
+  exposing a partially-written entry, and it is cheap because the key is dominated
+  by content hashes, so a second writer would be writing equivalent content anyway.
+- **The key namespace is flat.** The GitHub backend scopes caches per repository;
+  a `cache-local-path` does not. Sharing one directory between repositories or
+  workspaces shares one namespace. A collision needs a matching job name, OS,
+  architecture and lockfile hashes, so it is unlikely, but it is not prevented.
+- **`abs-` paths do not relocate.** Anything outside `CARGO_HOME`,
+  `GITHUB_WORKSPACE` and `HOME` restores to the absolute path it was saved from.
+- **A restore extracts the whole entry, not the paths the job asked for.** The
+  entry is keyed, not indexed, so if `cache-directories` changes between runs
+  that resolve to the same key, files the current job never requested are still
+  restored to wherever the saving job had them.
+- **An entry that does not restore in full is reported as a miss**, not a hit,
+  with a warning naming how many of its archives restored and why the rest did
+  not — whether the root is missing on this machine or the archive failed to
+  extract. A partial hit would stop a layered stack from consulting the next
+  layer and stop the action from re-saving, so a damaged entry would be served
+  forever.
+
+### Lookup strategies
+
+`cache-layer-strategy` decides how a restore searches the stack. It only matters
+with more than one layer.
+
+| Strategy | Behaviour |
+| --- | --- |
+| `exact-first` (default) | Pass 1 asks every layer, in order, for the exact key only. Pass 2 asks every layer, in order, with the restore keys as well. The first hit in either pass wins. |
+| `nearest-first` | A single pass, asking each layer for the exact key and the restore keys at once. The first layer to return anything wins. |
+
+They differ in exactly one situation: a nearer layer holds a prefix match while
+a farther layer holds the exact key. `exact-first` pays the download to get a
+perfect cache; `nearest-first` pays nothing and lets cargo rebuild the delta.
+Which is faster depends on the size of that delta, which is why both exist.
+`exact-first` costs nothing in the warm case — a nearest-layer exact hit ends
+pass 1 immediately and no other layer is contacted.
+
+`exact-first`'s first pass assumes that asking a backend for a key with no
+restore keys matches that key exactly rather than by prefix. That is GitHub's
+documented behaviour, and it is what the `local` provider does, but it is an
+assumption about the backend rather than something this action can enforce.
+
+### What gets written where
+
+| Restore outcome | Nearer layer written | Farther layer written |
+| --- | --- | --- |
+| Exact hit at the nearest layer | no | no |
+| Nearest miss, farther layer **exact** hit | **yes** — write-back, during restore | no |
+| Nearest miss, farther layer **partial** hit | yes — on save | yes — on save |
+| Miss at every layer | yes — on save | yes — on save |
+
+When a farther layer serves an **exact** hit, the nearer layers are populated
+from it before the restore returns. That write-back happens during the action's
+**restore** step and not its **save** step, which is not an implementation
+detail: `src/restore.ts` only calls `config.saveState()` when the restored key
+is *not* an exact match, and `src/save.ts` returns early when that state is
+empty. On an exact hit the save step therefore never runs at all, and a
+write-back placed there would never fire — silently, with a working cache that
+simply never got faster.
+
+With `lookup-only: true` nothing is downloaded, so there is nothing to write
+back: a farther-layer hit leaves the nearer layers exactly as they were.
+
+The two rows that save to every layer fall out of that same rule: the save step
+is only reached when the exact key was absent from every layer, so there is
+nothing to decide and no bookkeeping about which layer hit. It is also why a
+**partial** hit is deliberately *not* written back — the save step is guaranteed
+to follow and to write every layer, and writing back as well would compress and
+store the same tree twice, the second time on the restore path this feature
+exists to shorten. The trade-off: with `save-if: false` and a partial hit, the
+nearer layers keep nothing, but what they would have kept is a stale entry.
+
+Whether a hit counts as exact is decided with the same comparison `restore.ts`
+makes, so the two can never disagree about which step does the writing.
+
+### Failures
+
+A layer that throws is logged as a warning and the next layer is tried; a
+failing layer never fails the run. `@actions/cache` already treats cache-service
+failures as non-fatal, and a stack of providers is not stricter than the
+provider it wraps. A write-back that fails is warned about and otherwise
+ignored. The cache is considered available if any layer is available.
+
+Configuration mistakes — naming a provider that does not exist, `local` without
+a `cache-local-path`, or a `cache-layer-strategy` that is neither `exact-first`
+nor `nearest-first` — are reported as an error annotation and disable caching
+for the whole run. They do not fail the step: the provider stack is built
+outside the action's error handling, so the error reaches the top-level
+`uncaughtException` handler, which logs it and lets the process exit 0. If a job
+that should be cached is not, that error in the log is where to look.
 
 ## Debugging
 

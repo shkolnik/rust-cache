@@ -123,6 +123,14 @@ export class CacheConfig {
     envKeys.sort((a, b) => a.localeCompare(b));
     for (const key of envKeys) {
       const value = process.env[key];
+      // `CARGO_HOME` matches the `CARGO` prefix but names a *location*, not a build input: its
+      // value cannot change what the compiler produces. Hashing it puts the cargo home into both
+      // `cacheKey` and `restoreKey`, so two machines that export different cargo homes can never
+      // share an entry -- which is exactly what the `local` provider's relocatable entries exist
+      // to allow. Excluded by exact name; every other `CARGO*` variable still counts.
+      if (key === "CARGO_HOME") {
+        continue;
+      }
       if (envPrefixes.some((prefix) => key.startsWith(prefix)) && value) {
         hasher.update(`${key}=${value}`);
         keyEnvs.push(key);

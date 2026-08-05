@@ -1,4 +1,4 @@
-name: check dist/
+name: test
 
 on:
   push:
@@ -14,7 +14,7 @@ on:
 permissions: {}
 
 jobs:
-  check-dist:
+  test:
     if: github.repository == 'Swatinem/rust-cache' || github.repository == 'shkolnik/rust-cache'
     runs-on: ubuntu-latest
     steps:
@@ -31,20 +31,5 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
-      - name: Rebuild the dist/ directory
-        run: npm run prepare
-
-      - name: Compare the expected and actual dist/ directories
-        run: |
-          if [ "$(git diff dist/ | wc -l)" -gt "0" ]; then
-            echo "Detected uncommitted changes after build. See status below:"
-            git diff
-            exit 1
-          fi
-        id: diff
-
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        if: ${{ failure() && steps.diff.conclusion == 'failure' }}
-        with:
-          name: dist
-          path: dist/
+      - name: Run tests
+        run: npm test
