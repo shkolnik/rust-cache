@@ -1,0 +1,421 @@
+name: local-cache
+
+on: [push, pull_request]
+
+permissions: {}
+
+# This workflow proves the wiring of the `local` and layered `cache-provider`s end to end, as
+# opposed to their logic, which is covered by the `node:test` suite in `tests/utils.test.ts` /
+# `tests/layeredCache.test.ts` etc.
+#
+# `LocalCache` shells out to `tar`/`zstd` and writes one entry directory per key
+# (`<cache-local-path>/<key>/`, containing one archive per root: `cargo.tar.zst`,
+# `workspace.tar.zst`, `home.tar.zst`, `abs-<percent-encoded-path>.tar.zst`), which is portable
+# across OSes; every job below runs on all three GitHub-hosted runner OSes.
+#
+# `local-save` / `local-restore` demonstrate a genuine cold-miss -> warm-hit cycle on a single
+# `local` layer. GitHub-hosted runners are ephemeral, so the local cache directory written by
+# `local-save` does not exist on `local-restore`'s runner; an artifact bridges it across.
+#
+# `warm-github-for-writeback` / `layered-write-back` demonstrate write-back: a `local,github`
+# stack whose `local` layer starts cold restores an exact hit from the farther `github` layer,
+# and must synchronously populate `local` before returning. That has to happen inside
+# `restoreCache` (see `src/layeredCache.ts`) rather than `saveCache`, because `src/restore.ts`
+# only calls `config.saveState()` -- which is what makes `src/save.ts` do anything at all -- when
+# the restored key is *not* an exact match. On an exact hit `saveCache` is never invoked, so a
+# write-back living there would never fire.
+#
+# `local-relocate` demonstrates the reason this branch exists: an entry saved under one
+# `CARGO_HOME` restores cleanly under a different one, from the same local cache directory, on
+# all three OSes.
+#
+# Each matrix leg gets its own cache path (under `${{ runner.temp }}`, which is writable on all
+# three runner OSes, unlike a hard-coded `/tmp` or `/mnt/...`) and its own key component
+# (`${{ matrix.os }}`), so the three legs never share a cache entry.
+
+jobs:
+  # `actions/*-artifact` can only move a directory between jobs, and the `local` provider only
+  # writes its archive in the action's `post` step (`dist/save.js`), which the runner always
+  # executes *after every* normal step in the job -- including one that uploads the directory. A
+  # normal `upload-artifact` step placed after `uses: ./` would therefore run before the archive
+  # exists.
+  #
+  # Rather than fight that ordering, this job drives `dist/restore.js` and `dist/save.js` directly
+  # as plain `run:` steps (the exact same bundles `action.yml` points `main`/`post` at) instead of
+  # through `uses: ./`. That gives it full control of the sequence: restore, build, save, *then*
+  # upload -- all as ordinary steps in one job. The action's inputs are supplied as `INPUT_*`
+  # env vars, the same convention the runner itself uses for a `uses:` step.
+  #
+  # One more piece of the same puzzle: on a cache miss, `src/restore.ts` calls `config.saveState()`
+  # so that `src/save.ts`'s `post` step knows there's something to save (`isCacheUpToDate()` reads
+  # it back). `$GITHUB_STATE`, like `$GITHUB_OUTPUT`, is a fresh file *per step*; a later step's
+  # copy of that env var points at a different, empty file, so `core.getState()` there sees
+  # nothing -- confirmed in CI: without the in-step bridge below, `dist/save.js` logged
+  # "Cache up-to-date." and wrote nothing, and the immediately-preceding `dist/restore.js` step
+  # had definitely called `saveState()` (its own log showed the cold-miss branch). The fix reads
+  # `$GITHUB_STATE` back within the *same* restore step, right after `dist/restore.js` runs and
+  # while that file is still the one it wrote to, and re-emits the value via `$GITHUB_ENV`, which
+  # *is* documented to propagate to every later step in the job.
+  local-save:
+    if: github.repository == 'Swatinem/rust-cache' || github.repository == 'shkolnik/rust-cache'
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    name: Save to a cold local cache on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+
+    env:
+      CARGO_TERM_COLOR: always
+      INPUT_WORKSPACES: tests
+      INPUT_PREFIX-KEY: v0-rust
+      INPUT_SHARED-KEY: local-cache-${{ matrix.os }}-${{ github.run_id }}-${{ github.run_attempt }}
+      INPUT_ADD-JOB-ID-KEY: "true"
+      INPUT_ADD-RUST-ENVIRONMENT-HASH-KEY: "true"
+      INPUT_CACHE-TARGETS: "true"
+      INPUT_CACHE-ON-FAILURE: "false"
+      INPUT_CACHE-ALL-CRATES: "false"
+      INPUT_CACHE-WORKSPACE-CRATES: "false"
+      INPUT_SAVE-IF: "true"
+      INPUT_CACHE-PROVIDER: local
+      INPUT_CACHE-LOCAL-PATH: ${{ runner.temp }}/rust-cache-local
+      INPUT_CACHE-LAYER-STRATEGY: exact-first
+      INPUT_CACHE-BIN: "true"
+      INPUT_LOOKUP-ONLY: "false"
+      INPUT_CMD-FORMAT: "{0}"
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - run: rustup toolchain install stable --profile minimal --no-self-update
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24.x
+
+      # Make the cold-miss precondition explicit rather than resting solely on the run-id in the
+      # key: this path is under runner.temp, not guaranteed to be pruned between runs on a reused
+      # self-hosted-style runner.
+      - name: Ensure a cold local cache path
+        shell: bash
+        run: rm -rf "${{ runner.temp }}/rust-cache-local"
+
+      # $GITHUB_STATE (like $GITHUB_OUTPUT/$GITHUB_ENV) is a fresh, step-scoped file: the runner
+      # only turns *this* step's copy into a STATE_* env var for *this step's own* automatic
+      # post, never for a later plain `run:` step. A later step reading $GITHUB_STATE gets an
+      # empty file, not this step's -- confirmed by observing exactly that in CI. So the bridge
+      # from core.saveState() to core.getState() has to happen inside this same step, immediately
+      # after dist/restore.js, while $GITHUB_STATE still holds what it just wrote. It re-emits
+      # that value via $GITHUB_ENV, which -- unlike $GITHUB_STATE -- *is* documented to propagate
+      # to every later step in the job, so the save step below can pick it up.
+      # scaffolding: STATE_RUST_CACHE_CONFIG is left in $GITHUB_ENV for the rest of this job's
+      # steps; harmless here (no later step depends on its absence) but not cleaned up.
+      - name: "Restore (expected: cold miss)"
+        id: restore
+        shell: bash
+        run: |
+          node dist/restore.js
+          node -e '
+            const fs = require("fs");
+            const content = fs.readFileSync(process.env.GITHUB_STATE, "utf8");
+            const match = content.match(/^RUST_CACHE_CONFIG<<(\S+)\r?\n([\s\S]*?)\r?\n\1\r?\n?/m);
+            if (!match) {
+              console.log("No RUST_CACHE_CONFIG state was saved by the restore step; nothing to bridge.");
+              process.exit(0);
+            }
+            const delim = "ghadelimiter_bridge_" + Date.now();
+            fs.appendFileSync(process.env.GITHUB_ENV, `STATE_RUST_CACHE_CONFIG<<${delim}\n${match[2]}\n${delim}\n`);
+            console.log("Bridged RUST_CACHE_CONFIG state to later steps.");
+          '
+
+      - name: Verify cold miss
+        if: steps.restore.outputs.cache-hit == 'true'
+        shell: bash
+        run: |
+          echo "Expected a cold miss on a freshly created local cache path, but got a hit." >&2
+          exit 1
+
+      - run: cargo check
+        working-directory: tests
+
+      # Drive the save explicitly, at the point in the job where we want the archive to exist,
+      # rather than relying on the automatic post step (see the ordering note above the job).
+      - name: Save (writes the local cache entry)
+        shell: bash
+        run: node dist/save.js
+
+      - name: Show the entry that was just written
+        shell: bash
+        run: |
+          dir="${{ runner.temp }}/rust-cache-local"
+          entry_count=$(find "$dir" -mindepth 1 -maxdepth 1 -type d | wc -l)
+          if [ "$entry_count" -eq 0 ]; then
+            echo "No local cache entry was created." >&2
+            ls -la "$dir" >&2 || true
+            exit 1
+          fi
+          echo "local cache holds $entry_count entr(ies)"
+          find "$dir" -maxdepth 2 -mindepth 1
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: local-cache-${{ matrix.os }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/rust-cache-local
+          if-no-files-found: error
+          retention-days: 1
+
+  # Unlike local-save, this job has nothing after the restore that needs to happen before an
+  # automatic post step, so the post-step ordering constraint above does not apply here: this is a
+  # plain `uses: ./` restore, exactly like `save-restore.yml`'s restore job. Going through the real
+  # action invocation (rather than driving dist/restore.js by hand, as local-save must) is what
+  # exercises action.yml's input defaulting and the runner's own INPUT_* marshalling for
+  # `cache-provider: local` on the hit path -- the scenario local-save's manual driving can't cover.
+  local-restore:
+    if: github.repository == 'Swatinem/rust-cache' || github.repository == 'shkolnik/rust-cache'
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    name: Restore the warmed local cache on ${{ matrix.os }}
+    needs: local-save
+    runs-on: ${{ matrix.os }}
+
+    env:
+      CARGO_TERM_COLOR: always
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - run: rustup toolchain install stable --profile minimal --no-self-update
+
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: local-cache-${{ matrix.os }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/rust-cache-local
+
+      - id: cache
+        uses: ./
+        with:
+          workspaces: tests
+          cache-provider: local
+          cache-local-path: ${{ runner.temp }}/rust-cache-local
+          shared-key: local-cache-${{ matrix.os }}-${{ github.run_id }}-${{ github.run_attempt }}
+          save-if: "false"
+
+      - name: Verify exact cache hit
+        if: steps.cache.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          echo "The local cache entry saved by local-save could not be restored." >&2
+          exit 1
+
+  # The write-back demo: a `local,github` stack whose `local` layer is cold and whose `github`
+  # layer already holds the exact key. This job needs the `github` layer pre-populated by a run
+  # that has actually completed its save -- which, same as above, only happens in the automatic
+  # `post` step at the *end* of a job -- so a second, dependent job is required rather than a
+  # second step in this one.
+  warm-github-for-writeback:
+    if: github.repository == 'Swatinem/rust-cache' || github.repository == 'shkolnik/rust-cache'
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    name: Warm the github layer for the write-back demo on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+
+    env:
+      CARGO_TERM_COLOR: always
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - run: rustup toolchain install stable --profile minimal --no-self-update
+
+      - uses: ./
+        with:
+          workspaces: tests
+          cache-provider: github
+          shared-key: writeback-${{ matrix.os }}-${{ github.run_id }}-${{ github.run_attempt }}
+
+      - run: cargo check
+        working-directory: tests
+
+  layered-write-back:
+    if: github.repository == 'Swatinem/rust-cache' || github.repository == 'shkolnik/rust-cache'
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    name: Write-back into a cold local layer on a farther-layer hit on ${{ matrix.os }}
+    needs: warm-github-for-writeback
+    runs-on: ${{ matrix.os }}
+
+    env:
+      CARGO_TERM_COLOR: always
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - run: rustup toolchain install stable --profile minimal --no-self-update
+
+      # Make the cold-miss precondition explicit rather than resting solely on the run-id in the
+      # key: this path is under runner.temp, not guaranteed to be pruned between runs on a reused
+      # self-hosted-style runner.
+      - name: Ensure a cold local cache path
+        shell: bash
+        run: rm -rf "${{ runner.temp }}/rust-cache-writeback"
+
+      - id: cache
+        uses: ./
+        with:
+          workspaces: tests
+          cache-provider: local,github
+          cache-local-path: ${{ runner.temp }}/rust-cache-writeback
+          cache-layer-strategy: exact-first
+          shared-key: writeback-${{ matrix.os }}-${{ github.run_id }}-${{ github.run_attempt }}
+          save-if: "false"
+
+      - name: Verify exact cache hit (from the farther github layer)
+        if: steps.cache.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          echo "Expected an exact hit served by the github layer, but got none." >&2
+          exit 1
+
+      # The entry layout is a directory per key (`<cache-local-path>/<key>/`, holding one archive
+      # per root, e.g. `cargo.tar.zst`), not a single `<key>.tar.zst` file, so this asserts on the
+      # entry directory and the archives inside it rather than globbing `*.tar.zst` at the top
+      # level of the cache directory.
+      - name: Verify write-back populated the nearer, previously cold local layer
+        shell: bash
+        run: |
+          dir="${{ runner.temp }}/rust-cache-writeback"
+          entry_count=$(find "$dir" -mindepth 1 -maxdepth 1 -type d | wc -l)
+          if [ "$entry_count" -lt 1 ]; then
+            echo "Write-back did not populate the local layer at $dir." >&2
+            find "$dir" -maxdepth 2 -mindepth 1 >&2 || true
+            exit 1
+          fi
+          archive_count=$(find "$dir" -mindepth 2 -maxdepth 2 -type f -name '*.tar.zst' | wc -l)
+          if [ "$archive_count" -lt 1 ]; then
+            echo "Write-back created an entry directory at $dir but it holds no archives." >&2
+            find "$dir" -maxdepth 2 -mindepth 1 >&2 || true
+            exit 1
+          fi
+          echo "write-back populated $entry_count entr(ies) with $archive_count archive(s)"
+          find "$dir" -maxdepth 2 -mindepth 1
+
+  # The relocation demo: this is the whole reason this branch exists. An entry saved under one
+  # CARGO_HOME must restore cleanly under a *different* CARGO_HOME, from the same local cache
+  # directory, on all three OSes -- proving entries are portable rather than tied to the absolute
+  # paths they were saved from.
+  #
+  # Same post-step ordering constraint as local-save: the local provider only writes its entry in
+  # the action's automatic `post` step, so a step placed after `uses: ./` in the same job would run
+  # before that entry exists. This job therefore drives dist/restore.js and dist/save.js by hand,
+  # exactly as local-save does, and mirrors its $GITHUB_STATE -> $GITHUB_ENV bridge so the save
+  # step can see what the restore step decided.
+  local-relocate:
+    if: github.repository == 'Swatinem/rust-cache' || github.repository == 'shkolnik/rust-cache'
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    name: Relocate a local cache entry on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+
+    env:
+      CARGO_TERM_COLOR: always
+      INPUT_WORKSPACES: tests
+      INPUT_PREFIX-KEY: v0-rust
+      INPUT_SHARED-KEY: relocate-${{ matrix.os }}-${{ github.run_id }}-${{ github.run_attempt }}
+      INPUT_ADD-JOB-ID-KEY: "true"
+      INPUT_ADD-RUST-ENVIRONMENT-HASH-KEY: "true"
+      INPUT_CACHE-TARGETS: "true"
+      INPUT_CACHE-ON-FAILURE: "false"
+      INPUT_CACHE-ALL-CRATES: "false"
+      INPUT_CACHE-WORKSPACE-CRATES: "false"
+      INPUT_SAVE-IF: "true"
+      INPUT_CACHE-PROVIDER: local
+      INPUT_CACHE-LOCAL-PATH: ${{ runner.temp }}/relocate-cache
+      INPUT_CACHE-LAYER-STRATEGY: exact-first
+      INPUT_CACHE-BIN: "true"
+      INPUT_LOOKUP-ONLY: "false"
+      INPUT_CMD-FORMAT: "{0}"
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - run: rustup toolchain install stable --profile minimal --no-self-update
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24.x
+
+      - name: Ensure a cold local cache path
+        shell: bash
+        run: rm -rf "${{ runner.temp }}/relocate-cache"
+
+      # Same $GITHUB_STATE -> $GITHUB_ENV bridge as local-save (see the comment on that job): the
+      # save step below needs to see what this step's core.saveState() call recorded, and
+      # $GITHUB_STATE is a fresh file per step, so the bridge must run inside this same step.
+      - name: "Save under the first CARGO_HOME"
+        id: restore_a
+        shell: bash
+        env:
+          CARGO_HOME: ${{ runner.temp }}/cargo-a
+        run: |
+          node dist/restore.js
+          node -e '
+            const fs = require("fs");
+            const content = fs.readFileSync(process.env.GITHUB_STATE, "utf8");
+            const match = content.match(/^RUST_CACHE_CONFIG<<(\S+)\r?\n([\s\S]*?)\r?\n\1\r?\n?/m);
+            if (!match) {
+              console.log("No RUST_CACHE_CONFIG state was saved by the restore step; nothing to bridge.");
+              process.exit(0);
+            }
+            const delim = "ghadelimiter_bridge_" + Date.now();
+            fs.appendFileSync(process.env.GITHUB_ENV, `STATE_RUST_CACHE_CONFIG<<${delim}\n${match[2]}\n${delim}\n`);
+            console.log("Bridged RUST_CACHE_CONFIG state to later steps.");
+          '
+
+      - run: cargo check
+        working-directory: tests
+        env:
+          CARGO_HOME: ${{ runner.temp }}/cargo-a
+
+      - name: Save (writes the local cache entry)
+        shell: bash
+        env:
+          CARGO_HOME: ${{ runner.temp }}/cargo-a
+        run: node dist/save.js
+
+      - name: Show the entry that was written
+        shell: bash
+        run: find "${{ runner.temp }}/relocate-cache" -maxdepth 2 -mindepth 1
+
+      - name: "Restore under a different CARGO_HOME"
+        shell: bash
+        env:
+          CARGO_HOME: ${{ runner.temp }}/cargo-b
+        run: node dist/restore.js
+
+      - name: Assert the registry landed under the second CARGO_HOME
+        shell: bash
+        run: |
+          if [ ! -d "${{ runner.temp }}/cargo-b/registry" ]; then
+            echo "The entry did not relocate: no registry under cargo-b." >&2
+            find "${{ runner.temp }}/cargo-b" -maxdepth 2 -mindepth 1 >&2 || true
+            exit 1
+          fi
+          echo "relocated into cargo-b/registry"

@@ -1,4 +1,4 @@
-import { e as error, g as getCacheProvider, a as getInput, d as isCacheUpToDate, i as info, C as CacheConfig, c as cleanTargetDir, f as debug, h as cleanRegistry, j as cleanBin, k as cleanGit, r as reportError, l as exec } from './cleanup-BaSEYL-3.js';
+import { e as error, g as getCacheProvider, a as getInput, d as isCacheUpToDate, i as info, C as CacheConfig, c as cleanTargetDir, f as debug, h as cleanRegistry, j as cleanBin, k as cleanGit, r as reportError, l as exec } from './cleanup-DpUnPhLk.js';
 import 'os';
 import 'crypto';
 import 'fs';
@@ -33,6 +33,10 @@ import 'child_process';
 import 'timers';
 import 'stream';
 import 'fs/promises';
+import 'node:crypto';
+import 'node:fs';
+import 'node:path';
+import 'node:os';
 
 process.on("uncaughtException", (e) => {
     error(e.message);

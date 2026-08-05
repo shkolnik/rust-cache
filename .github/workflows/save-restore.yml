@@ -6,7 +6,7 @@ permissions: {}
 
 jobs:
   save:
-    if: github.repository == 'Swatinem/rust-cache'
+    if: github.repository == 'Swatinem/rust-cache' || github.repository == 'shkolnik/rust-cache'
     strategy:
       fail-fast: false
       matrix:
@@ -35,7 +35,7 @@ jobs:
         working-directory: tests
 
   restore:
-    if: github.repository == 'Swatinem/rust-cache'
+    if: github.repository == 'Swatinem/rust-cache' || github.repository == 'shkolnik/rust-cache'
     strategy:
       fail-fast: false
       matrix:

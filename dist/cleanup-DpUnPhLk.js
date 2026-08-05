@@ -38,7 +38,11 @@ import require$$6 from 'string_decoder';
 import * as require$$2$1 from 'child_process';
 import { setTimeout as setTimeout$1 } from 'timers';
 import 'stream';
-import fs$1 from 'fs/promises';
+import fs$2 from 'fs/promises';
+import { randomUUID } from 'node:crypto';
+import fs$1 from 'node:fs';
+import path$2 from 'node:path';
+import os$1 from 'node:os';
 
 // We use any as a valid input type
 /* eslint-disable @typescript-eslint/no-explicit-any */
@@ -34392,6 +34396,477 @@ function parse(toml, { maxDepth = 1000, integersAsBigInt } = {}) {
     return res;
 }
 
+/**
+ * The very comparison `src/restore.ts` makes to decide whether a restore was a full match. It has
+ * to stay the same one: write-back happens exactly when that comparison says the save step will
+ * not run, and a divergence would either double the work or skip the write-back entirely.
+ */
+function isExactMatch(restoredKey, primaryKey) {
+    return restoredKey.localeCompare(primaryKey, undefined, { sensitivity: "accent" }) === 0;
+}
+/**
+ * Composes providers into a single cache, ordered nearest (cheapest) first.
+ *
+ * A layer that fails degrades to the next one, and never fails the run.
+ */
+function createLayeredCache(providers, strategy) {
+    async function restoreFrom(provider, paths, key, restoreKeys, options, enableCrossOsArchive) {
+        try {
+            return await provider.cache.restoreCache(paths.slice(), key, restoreKeys, options, enableCrossOsArchive);
+        }
+        catch (e) {
+            warning(`Cache layer "${provider.name}" failed to restore: ${e}`);
+            return undefined;
+        }
+    }
+    /**
+     * Populates the layers nearer than the one that served `key`.
+     *
+     * This has to happen here rather than in `saveCache`: `restore.ts` only calls `config.saveState()`
+     * when the restored key is not an exact match, and `save.ts` does nothing without that state, so
+     * an exact hit never reaches `saveCache` at all. By the same rule it is only ever called for an
+     * exact match — anything else is followed by a `saveCache` that writes every layer anyway, and
+     * writing twice would put a second full compression on the restore path.
+     */
+    async function writeBack(nearer, paths, key, options) {
+        if (!nearer.length) {
+            return;
+        }
+        if (options?.lookupOnly) {
+            info(`Not writing "${key}" back: nothing was downloaded.`);
+            return;
+        }
+        for (const provider of nearer) {
+            try {
+                await provider.cache.saveCache(paths.slice(), key);
+                info(`Wrote "${key}" back to cache layer "${provider.name}".`);
+            }
+            catch (e) {
+                warning(`Cache layer "${provider.name}" failed to store the write-back of "${key}": ${e}`);
+            }
+        }
+    }
+    return {
+        isFeatureAvailable() {
+            return providers.some((provider) => {
+                try {
+                    return provider.cache.isFeatureAvailable();
+                }
+                catch (e) {
+                    warning(`Cache layer "${provider.name}" is unavailable: ${e}`);
+                    return false;
+                }
+            });
+        },
+        async restoreCache(paths, primaryKey, restoreKeys = [], options, enableCrossOsArchive) {
+            // A single layer already tries the primary key before the restore keys, so an exact-only
+            // pre-pass over it would only ever be a wasted round trip.
+            const passes = strategy === "nearest-first" || providers.length === 1 ? [restoreKeys] : [[], restoreKeys];
+            for (const keys of passes) {
+                for (const [index, provider] of providers.entries()) {
+                    const restoredKey = await restoreFrom(provider, paths, primaryKey, keys, options, enableCrossOsArchive);
+                    if (!restoredKey) {
+                        continue;
+                    }
+                    info(`Cache layer "${provider.name}" served "${restoredKey}".`);
+                    if (isExactMatch(restoredKey, primaryKey)) {
+                        await writeBack(providers.slice(0, index), paths, restoredKey, options);
+                    }
+                    else if (index > 0) {
+                        info(`Not writing "${restoredKey}" back: the save step writes every layer after a partial hit.`);
+                    }
+                    return restoredKey;
+                }
+            }
+            return undefined;
+        },
+        async saveCache(paths, key) {
+            let result;
+            for (const provider of providers) {
+                try {
+                    const saved = await provider.cache.saveCache(paths.slice(), key);
+                    result ??= saved;
+                }
+                catch (e) {
+                    warning(`Cache layer "${provider.name}" failed to save "${key}": ${e}`);
+                }
+            }
+            if (result === undefined) {
+                warning(`No cache layer stored "${key}".`);
+                return -1;
+            }
+            return result;
+        },
+    };
+}
+
+const ABS_PREFIX = "abs-";
+/** Everything outside this set is percent-encoded, so a token is always a legal file name. */
+const UNRESERVED = /^[A-Za-z0-9._-]$/;
+function clean(value) {
+    const trimmed = value?.trim();
+    return trimmed ? trimmed : undefined;
+}
+/**
+ * The roots this machine offers, longest first so a prefix search can take the first match.
+ * The environment and the home directory are parameters rather than reads of `process.env` and
+ * `os.homedir()` so every platform's behaviour is testable from any platform.
+ *
+ * `homeDir` must agree with what `config.ts` uses to build the paths it asks to cache, or those
+ * paths fall under no root and become non-relocatable `abs-` archives with no warning. `config.ts`
+ * derives them from `os.homedir()`, which already prefers `$HOME` on POSIX and `%USERPROFILE%` on
+ * Windows and only falls back to the passwd entry when that is unset -- so reading `env.HOME` first
+ * and `homeDir` second reproduces it exactly, including the container case where `HOME` is unset.
+ */
+function rootTable(env, p = path$2, homeDir = os$1.homedir()) {
+    const home = clean(env.HOME) ?? clean(homeDir);
+    const candidates = [
+        ["cargo", clean(env.CARGO_HOME) ?? (home && p.join(home, ".cargo"))],
+        ["workspace", clean(env.GITHUB_WORKSPACE)],
+        ["home", home],
+    ];
+    return candidates
+        .flatMap(([token, dir]) => (dir ? [{ token, dir: p.resolve(dir) }] : []))
+        .sort((a, b) => b.dir.length - a.dir.length);
+}
+/** Percent-encodes every byte outside `[A-Za-z0-9._-]`, so the result is a legal file name. */
+function encodePathToken(abs) {
+    let encoded = "";
+    for (const byte of Buffer.from(abs, "utf8")) {
+        const char = String.fromCharCode(byte);
+        encoded += UNRESERVED.test(char) ? char : `%${byte.toString(16).toUpperCase().padStart(2, "0")}`;
+    }
+    return encoded;
+}
+/** The inverse of {@link encodePathToken}. */
+function decodePathToken(token) {
+    const bytes = [];
+    for (let i = 0; i < token.length; i++) {
+        if (token[i] === "%") {
+            bytes.push(parseInt(token.slice(i + 1, i + 3), 16));
+            i += 2;
+        }
+        else {
+            bytes.push(token.charCodeAt(i));
+        }
+    }
+    return Buffer.from(bytes).toString("utf8");
+}
+/** Windows path comparison is case-insensitive; POSIX is not. */
+function fold(value, p) {
+    return p === path$2.win32 ? value.toLowerCase() : value;
+}
+/** Which archive holds `target`, and under what member name. */
+function assignRoot(target, roots, p = path$2) {
+    const abs = p.resolve(target);
+    if (p.dirname(abs) === abs) {
+        throw new Error(`The path ${abs} is a filesystem root and cannot be cached.`);
+    }
+    // `roots` is sorted longest-first, so the first match is the longest one.
+    for (const root of roots) {
+        const folded = fold(abs, p);
+        const prefix = fold(root.dir, p);
+        if (folded === prefix || folded.startsWith(prefix + p.sep)) {
+            return { token: root.token, dir: root.dir, member: p.relative(root.dir, abs) || "." };
+        }
+    }
+    return {
+        token: ABS_PREFIX + encodePathToken(abs),
+        dir: p.dirname(abs),
+        member: p.basename(abs),
+    };
+}
+/** Groups requested paths into one archive per root, preserving order and dropping duplicates. */
+function groupByRoot(targets, roots, p = path$2) {
+    const grouped = new Map();
+    for (const target of targets) {
+        const { token, dir, member } = assignRoot(target, roots, p);
+        const group = grouped.get(token) ?? { dir, members: [] };
+        if (!group.members.includes(member)) {
+            group.members.push(member);
+        }
+        grouped.set(token, group);
+    }
+    return grouped;
+}
+/** The directory an archive named `<token>.tar.zst` must be extracted under, if this machine has it. */
+function resolveToken(token, roots, p = path$2) {
+    if (token.startsWith(ABS_PREFIX)) {
+        return p.dirname(decodePathToken(token.slice(ABS_PREFIX.length)));
+    }
+    return roots.find((root) => root.token === token)?.dir;
+}
+
+/** The first of `names` this machine has. Single words only: tar word-splits nothing for us. */
+function firstProgram(probe, names) {
+    return names.find((name) => probe.which(name));
+}
+function detectTarTool(probe) {
+    let tarPath;
+    const createArgs = [];
+    const extractArgs = [];
+    if (probe.platform === "win32") {
+        // Windows ships BSD tar. `@actions/cache` pipes zstd through a temp file rather than
+        // `--use-compress-program` for exactly that combination -- its `BSD_TAR_ZSTD` condition is
+        // `BSD && zstd && IS_WINDOWS` (`lib/internal/tar.js`), and the `IS_WINDOWS` term is why stock
+        // macOS BSD tar needs no such workaround. Rather than reimplement the workaround, require Git
+        // for Windows' GNU tar and treat its absence as an error rather than a degrade.
+        // `path.win32`, not `path`: detection must build a well-formed Windows path even when the
+        // probe runs on a POSIX host (as it does under test), where the bare `path` module joins
+        // with `/` and would mangle the drive-letter segment.
+        const gnuTar = path$2.win32.join(probe.env["ProgramFiles"] ?? "C:\\Program Files", "Git", "usr", "bin", "tar.exe");
+        if (!probe.exists(gnuTar)) {
+            throw new Error(`The local cache needs GNU tar on Windows, but ${gnuTar} does not exist.` +
+                ` Install Git for Windows, which provides it.`);
+        }
+        tarPath = gnuTar;
+        // Without this, GNU tar reads the `C:` in a path as a remote host name.
+        createArgs.push("--force-local");
+        extractArgs.push("--force-local");
+    }
+    else if (probe.platform === "darwin") {
+        const gnuTar = probe.which("gtar");
+        if (gnuTar) {
+            tarPath = gnuTar;
+            extractArgs.push("--delay-directory-restore"); // GNU-only; stock BSD tar runs without it.
+        }
+        else {
+            tarPath = probe.which("tar");
+        }
+    }
+    else {
+        tarPath = probe.which("tar");
+    }
+    if (!tarPath) {
+        throw new Error("The local cache needs `tar` on PATH, but it was not found.");
+    }
+    const compress = firstProgram(probe, ["zstdmt", "zstd"]);
+    const decompress = firstProgram(probe, ["unzstd", "zstd"]);
+    if (!compress || !decompress) {
+        throw new Error("The local cache needs `zstd` on PATH, but it was not found.");
+    }
+    return {
+        tarPath,
+        createArgs,
+        extractArgs,
+        compressArgs: ["--use-compress-program", compress],
+        decompressArgs: ["--use-compress-program", decompress],
+    };
+}
+/** `which`, synchronously and without a dependency: `@actions/io`'s only form is async. */
+function whichSync(env, tool) {
+    const extensions = process.platform === "win32" ? (env["PATHEXT"] ?? ".EXE;.CMD;.BAT;.COM").split(";").filter(Boolean) : [""];
+    for (const dir of (env["PATH"] ?? "").split(path$2.delimiter).filter(Boolean)) {
+        for (const extension of extensions) {
+            const candidate = path$2.join(dir, tool + extension);
+            try {
+                if (fs$1.statSync(candidate).isFile()) {
+                    fs$1.accessSync(candidate, fs$1.constants.X_OK);
+                    return candidate;
+                }
+            }
+            catch {
+                // Not there, or not executable by us: keep looking.
+            }
+        }
+    }
+    return undefined;
+}
+let cached;
+/** The real probe, resolved at most once per process. A failure is not cached. */
+function tarTool() {
+    cached ??= detectTarTool({
+        platform: process.platform,
+        env: process.env,
+        which: (tool) => whichSync(process.env, tool),
+        exists: (file) => fs$1.existsSync(file),
+    });
+    return cached;
+}
+
+const SUFFIX = ".tar.zst";
+/**
+ * A filesystem cache. An entry is a directory `<cacheDir>/<key>/` holding one archive per root,
+ * named for that root's token. Members are relative to their root, so an entry saved on one
+ * machine restores correctly on another whose roots sit elsewhere.
+ *
+ * It knows nothing about other caches or about layering; compose it with `createLayeredCache`.
+ */
+function createLocalCache(configuredDir, env = process.env, tool = tarTool) {
+    // Resolved once, so no entry can ever land somewhere that depends on the process's cwd.
+    const cacheDir = configuredDir.trim() ? path$2.resolve(configuredDir.trim()) : "";
+    const roots = rootTable(env);
+    /** The entry directory for `key`. A key is only ever a name, never a path. */
+    function entryPath(key) {
+        if (!cacheDir) {
+            throw new Error("The local cache has no directory: `cache-local-path` is empty.");
+        }
+        if (!key || key.includes("/") || key.includes("\\") || key.includes("..")) {
+            throw new Error(`The cache key \`${key}\` cannot be used as a local cache file name.`);
+        }
+        return path$2.join(cacheDir, key);
+    }
+    /** The key of the most recently written entry matching `prefix`, if any. */
+    async function findByPrefix(prefix) {
+        const entries = await fs$1.promises.readdir(cacheDir, { withFileTypes: true });
+        let best;
+        for (const entry of entries) {
+            // Dot-prefixed directories are half-written temporaries, and must never be served.
+            if (!entry.isDirectory() || entry.name.startsWith(".") || !entry.name.startsWith(prefix)) {
+                continue;
+            }
+            const { mtimeMs } = await fs$1.promises.stat(path$2.join(cacheDir, entry.name));
+            if (!best || mtimeMs > best.mtimeMs) {
+                best = { key: entry.name, mtimeMs };
+            }
+        }
+        return best?.key;
+    }
+    async function findKey(primaryKey, restoreKeys) {
+        if (await exists(entryPath(primaryKey))) {
+            return primaryKey;
+        }
+        if (!(await exists(cacheDir))) {
+            return undefined;
+        }
+        for (const prefix of restoreKeys) {
+            const key = await findByPrefix(prefix);
+            if (key) {
+                return key;
+            }
+        }
+        return undefined;
+    }
+    return {
+        isFeatureAvailable() {
+            if (!cacheDir) {
+                warning("The local cache is unavailable: no `cache-local-path` was configured.");
+                return false;
+            }
+            try {
+                fs$1.mkdirSync(cacheDir, { recursive: true });
+                fs$1.accessSync(cacheDir, fs$1.constants.W_OK);
+            }
+            catch (e) {
+                warning(`The local cache directory ${cacheDir} is not writable: ${e}`);
+                return false;
+            }
+            try {
+                // Probed here, not left to the first `restoreCache`, so a host without `tar` or `zstd`
+                // reports "unavailable" once instead of throwing from restore and then again from save.
+                tool();
+            }
+            catch (e) {
+                warning(`The local cache is unavailable: ${e instanceof Error ? e.message : e}`);
+                return false;
+            }
+            return true;
+        },
+        async restoreCache(_paths, primaryKey, restoreKeys = [], options) {
+            // `findKey` calls `entryPath`, which validates the key before any filesystem work.
+            const key = await findKey(primaryKey, restoreKeys);
+            if (!key) {
+                info(`No local cache entry for "${primaryKey}" in ${cacheDir}.`);
+                return undefined;
+            }
+            if (options?.lookupOnly) {
+                info(`Found "${key}" in the local cache at ${cacheDir}.`);
+                return key;
+            }
+            const tar = tool();
+            const dir = entryPath(key);
+            const archives = (await fs$1.promises.readdir(dir)).filter((name) => name.endsWith(SUFFIX));
+            let restored = 0;
+            const failures = [];
+            for (const archive of archives) {
+                const token = archive.slice(0, -SUFFIX.length);
+                const target = resolveToken(token, roots);
+                if (!target) {
+                    failures.push(`"${archive}": this machine has no "${token}" root, so there is nowhere to put it`);
+                    continue;
+                }
+                await fs$1.promises.mkdir(target, { recursive: true });
+                try {
+                    await exec(tar.tarPath, [...tar.extractArgs, ...tar.decompressArgs, "-xf", path$2.join(dir, archive), "-C", target], { silent: true });
+                }
+                catch (e) {
+                    // A corrupt or truncated archive must degrade like an unplaceable one: recorded, not
+                    // thrown. Throwing here would abort the loop mid-entry and reach `restore.ts` as
+                    // "nothing was saved" rather than as the incomplete restore it actually is.
+                    failures.push(`"${archive}": failed to extract: ${e}`);
+                    continue;
+                }
+                restored++;
+            }
+            if (restored !== archives.length || !archives.length) {
+                // Anything short of the whole entry is a miss. Reporting a partial restore as an exact hit
+                // would make `restore.ts` compute `match === true`, so it never calls `saveState()`,
+                // `save.ts` no-ops, and a layered stack never consults the farther layer — leaving the
+                // incomplete entry to be served forever, since the first writer also wins.
+                warning(`The local cache entry "${key}" restored ${restored} of ${archives.length} archive(s), so it` +
+                    ` is reported as a miss and will be rebuilt.` +
+                    (failures.length ? ` Not restored: ${failures.join("; ")}.` : ""));
+                return undefined;
+            }
+            info(`Restored "${key}" from the local cache at ${cacheDir} (${restored} archive(s)).`);
+            return key;
+        },
+        async saveCache(paths, key) {
+            const entry = entryPath(key);
+            const tar = tool();
+            await fs$1.promises.mkdir(cacheDir, { recursive: true });
+            const present = [];
+            for (const p of paths) {
+                if (await exists(p)) {
+                    present.push(path$2.resolve(p));
+                }
+                else {
+                    debug(`Not caching ${p} locally: it does not exist.`);
+                }
+            }
+            if (!present.length) {
+                throw new Error(`None of the paths to cache under "${key}" exist: ${paths.join(", ")}`);
+            }
+            // A reader must see either a whole entry or none. The entry is built under a temp name and
+            // renamed in, and a directory rename is atomic where writing archives in place is not.
+            const temp = path$2.join(cacheDir, `.${key}.${randomUUID()}.tmp`);
+            await fs$1.promises.mkdir(temp, { recursive: true });
+            let size = 0;
+            try {
+                for (const [token, { dir, members }] of groupByRoot(present, roots)) {
+                    const archive = path$2.join(temp, token + SUFFIX);
+                    await exec(tar.tarPath, [...tar.createArgs, ...tar.compressArgs, "-cf", archive, "-C", dir, ...members], { silent: true });
+                    size += (await fs$1.promises.stat(archive)).size;
+                }
+            }
+            catch (e) {
+                // An archive failed to build: nothing to keep, and the caller must hear about it.
+                await fs$1.promises.rm(temp, { recursive: true, force: true });
+                throw e;
+            }
+            try {
+                await fs$1.promises.rename(temp, entry);
+            }
+            catch (e) {
+                await fs$1.promises.rm(temp, { recursive: true, force: true });
+                // First writer wins. A rename onto a populated directory fails rather than replacing it,
+                // so a concurrent saver observes either a complete entry or none — never a merge. Any
+                // other rename failure is a real error and must not be mistaken for a lost race.
+                if (!(await exists(entry))) {
+                    throw e;
+                }
+                // A save that was asked to write and wrote nothing is a degrade, not routine info: this
+                // is the only place that can say so, since the caller only sees a byte count.
+                warning(`The local cache already holds "${key}"; keeping the existing entry and discarding the` +
+                    ` ${size} byte(s) just built.`);
+                return size;
+            }
+            info(`Saved "${key}" to the local cache at ${entry} (${size} bytes).`);
+            return size;
+        },
+    };
+}
+
 function reportError(e) {
     const { commandFailed } = e;
     if (commandFailed) {
@@ -34429,22 +34904,56 @@ async function getCmdOutput(cmdFormat, cmd, options = {}) {
     }
     return stdout;
 }
-async function getCacheProvider() {
-    const cacheProvider = getInput("cache-provider");
+async function getSingleCacheProvider(cacheProvider) {
     let cache;
     switch (cacheProvider) {
         case "github":
-            cache = await import('./cache-CxTjXol0.js');
+            cache = await import('./cache-0tJTt36v.js');
             break;
         case "warpbuild":
-            cache = await import('./cache-DhiwylR9.js').then(function (n) { return n.c; });
+            cache = await import('./cache-DpOsinK7.js').then(function (n) { return n.c; });
             break;
+        case "local": {
+            const localPath = getInput("cache-local-path");
+            if (!localPath) {
+                throw new Error("The `local` `cache-provider` requires a `cache-local-path`.");
+            }
+            cache = createLocalCache(localPath);
+            break;
+        }
         default:
             throw new Error(`The \`cache-provider\` \`${cacheProvider}\` is not valid.`);
     }
     return {
         name: cacheProvider,
         cache: cache,
+    };
+}
+function getLayerStrategy() {
+    const strategy = getInput("cache-layer-strategy") || "exact-first";
+    if (strategy !== "exact-first" && strategy !== "nearest-first") {
+        throw new Error(`The \`cache-layer-strategy\` \`${strategy}\` is not valid. Use \`exact-first\` or \`nearest-first\`.`);
+    }
+    return strategy;
+}
+async function getCacheProvider() {
+    const input = getInput("cache-provider");
+    const names = input.split(",").map((name) => name.trim());
+    if (names.some((name) => !name)) {
+        throw new Error(`The \`cache-provider\` \`${input}\` is not valid: it has an empty entry.`);
+    }
+    const strategy = getLayerStrategy();
+    const providers = [];
+    for (const name of names) {
+        providers.push(await getSingleCacheProvider(name));
+    }
+    // A single provider is used as-is: no wrapper, and nothing an existing user can observe.
+    if (providers.length === 1) {
+        return providers[0];
+    }
+    return {
+        name: names.join(","),
+        cache: createLayeredCache(providers, strategy),
     };
 }
 async function exists(path) {
@@ -34587,6 +35096,14 @@ class CacheConfig {
         envKeys.sort((a, b) => a.localeCompare(b));
         for (const key of envKeys) {
             const value = process.env[key];
+            // `CARGO_HOME` matches the `CARGO` prefix but names a *location*, not a build input: its
+            // value cannot change what the compiler produces. Hashing it puts the cargo home into both
+            // `cacheKey` and `restoreKey`, so two machines that export different cargo homes can never
+            // share an entry -- which is exactly what the `local` provider's relocatable entries exist
+            // to allow. Excluded by exact name; every other `CARGO*` variable still counts.
+            if (key === "CARGO_HOME") {
+                continue;
+            }
             if (envPrefixes.some((prefix) => key.startsWith(prefix)) && value) {
                 hasher.update(`${key}=${value}`);
                 keyEnvs.push(key);
@@ -34626,7 +35143,7 @@ class CacheConfig {
                 const cargo_manifests = sort_and_uniq(workspaceMembers.map((member) => path__default.join(member.path, "Cargo.toml")));
                 for (const cargo_manifest of cargo_manifests) {
                     try {
-                        const content = await fs$1.readFile(cargo_manifest, { encoding: "utf8" });
+                        const content = await fs$2.readFile(cargo_manifest, { encoding: "utf8" });
                         // Use any since TomlPrimitive is not exposed
                         const parsed = parse(content);
                         if ("package" in parsed) {
@@ -34668,7 +35185,7 @@ class CacheConfig {
                 const cargo_lock = path__default.join(workspace.root, "Cargo.lock");
                 if (await exists(cargo_lock)) {
                     try {
-                        const content = await fs$1.readFile(cargo_lock, { encoding: "utf8" });
+                        const content = await fs$2.readFile(cargo_lock, { encoding: "utf8" });
                         const parsed = parse(content);
                         if ((parsed.version !== 3 && parsed.version !== 4) || !("package" in parsed)) {
                             // Fallback to caching them as regular file since this action
@@ -34804,7 +35321,7 @@ function digest(hasher) {
 async function getCargoBins() {
     const bins = new Set();
     try {
-        const dir = await fs$1.opendir(path__default.join(CARGO_HOME, "bin"));
+        const dir = await fs$2.opendir(path__default.join(CARGO_HOME, "bin"));
         for await (const dirent of dir) {
             if (dirent.isFile()) {
                 bins.add(dirent.name);
@@ -34854,7 +35371,7 @@ async function globFiles(pattern) {
     // file is actually a regular file.
     const files = [];
     for (const file of await globber.glob()) {
-        const stats = await fs$1.stat(file);
+        const stats = await fs$2.stat(file);
         if (stats.isFile()) {
             files.push(file);
         }
