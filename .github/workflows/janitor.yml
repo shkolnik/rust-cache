@@ -1,0 +1,174 @@
+name: Storage janitor
+
+# Reusable workflow: prunes GitHub Actions storage for a caller repo.
+#
+# Scope is intentionally narrow: this workflow deletes ONLY Actions artifacts
+# and Actions caches. It NEVER touches GitHub Releases or release assets —
+# release assets can be load-bearing (e.g. pinned binary distributions) and
+# must never be pruned by an automated job.
+#
+# Caller usage:
+#
+#   jobs:
+#     janitor:
+#       uses: shkolnik/rust-cache/.github/workflows/janitor.yml@main
+#       with:
+#         artifact-retention-days: 7
+#         prune-pr-caches: true
+#         dry-run: false
+#       permissions:
+#         actions: write
+#         pull-requests: read
+#
+# The caller's `secrets.GITHUB_TOKEN` is inherited automatically by reusable
+# workflows called via `uses:` in the same job — no explicit secret passing
+# is required. The token needs `actions: write` (set via `permissions:` on
+# the caller job) to list/delete artifacts and caches, and `pull-requests:
+# read` so `gh pr view` can look up PR state for the PR-cache prune step.
+
+on:
+  workflow_call:
+    inputs:
+      artifact-retention-days:
+        description: "Delete non-expired artifacts older than this many days"
+        type: number
+        default: 7
+      prune-pr-caches:
+        description: "Delete Actions caches belonging to closed/merged PRs"
+        type: boolean
+        default: true
+      dry-run:
+        description: "Log what would be deleted without deleting anything"
+        type: boolean
+        default: false
+
+permissions:
+  actions: write
+  pull-requests: read
+
+jobs:
+  prune-artifacts:
+    name: Prune old artifacts
+    runs-on: ubuntu-latest
+    steps:
+      - name: Prune non-expired artifacts older than retention window
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          RETENTION_DAYS: ${{ inputs.artifact-retention-days }}
+          DRY_RUN: ${{ inputs.dry-run }}
+        run: |
+          set -euo pipefail
+
+          cutoff_epoch=$(date -u -d "-${RETENTION_DAYS} days" +%s)
+          echo "Pruning artifacts in ${REPO} older than ${RETENTION_DAYS} days (cutoff: $(date -u -d "@${cutoff_epoch}" --iso-8601=seconds))"
+
+          total_count=0
+          total_bytes=0
+
+          gh api --paginate "repos/${REPO}/actions/artifacts" \
+            --jq '.artifacts[] | select(.expired == false) | [.id, .name, .size_in_bytes, .created_at] | @tsv' \
+            > /tmp/artifacts.tsv
+
+          while IFS=$'\t' read -r id name size created_at; do
+            [ -z "${id:-}" ] && continue
+            created_epoch=$(date -u -d "${created_at}" +%s)
+            if [ "${created_epoch}" -lt "${cutoff_epoch}" ]; then
+              age_days=$(( (cutoff_epoch - created_epoch) / 86400 + RETENTION_DAYS ))
+              if [ "${DRY_RUN}" = "true" ]; then
+                echo "[dry-run] would delete artifact id=${id} name=${name} size=${size} bytes age=~${age_days}d"
+              else
+                echo "deleting artifact id=${id} name=${name} size=${size} bytes age=~${age_days}d"
+                gh api -X DELETE "repos/${REPO}/actions/artifacts/${id}"
+              fi
+              total_count=$((total_count + 1))
+              total_bytes=$((total_bytes + size))
+            fi
+          done < /tmp/artifacts.tsv
+
+          if [ "${DRY_RUN}" = "true" ]; then
+            echo "Artifact prune (dry-run) totals: ${total_count} artifact(s), ${total_bytes} byte(s) would be reclaimed"
+          else
+            echo "Artifact prune totals: ${total_count} artifact(s) deleted, ${total_bytes} byte(s) reclaimed"
+          fi
+
+  prune-pr-caches:
+    name: Prune closed/merged PR caches
+    if: ${{ inputs.prune-pr-caches }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Prune caches belonging to closed/merged PRs
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          DRY_RUN: ${{ inputs.dry-run }}
+        run: |
+          set -euo pipefail
+
+          echo "Scanning PR-ref caches in ${REPO}"
+
+          gh api --paginate "repos/${REPO}/actions/caches" \
+            --jq '.actions_caches[] | select(.ref | test("^refs/pull/[0-9]+/(merge|head)$")) | [.id, .key, .ref, .size_in_bytes] | @tsv' \
+            > /tmp/pr_caches.tsv
+
+          # Distinct PR numbers referenced by any cache.
+          cut -f3 /tmp/pr_caches.tsv | sed -E 's#^refs/pull/([0-9]+)/.*#\1#' | sort -un > /tmp/pr_numbers.txt
+
+          total_count=0
+          total_bytes=0
+
+          while read -r pr_number; do
+            [ -z "${pr_number:-}" ] && continue
+            pr_state=$(gh pr view "${pr_number}" --repo "${REPO}" --json state --jq .state)
+            echo "PR #${pr_number} state=${pr_state}"
+
+            if [ "${pr_state}" = "CLOSED" ] || [ "${pr_state}" = "MERGED" ]; then
+              while IFS=$'\t' read -r id key ref size; do
+                [ -z "${id:-}" ] && continue
+                case "${ref}" in
+                  "refs/pull/${pr_number}/merge"|"refs/pull/${pr_number}/head")
+                    if [ "${DRY_RUN}" = "true" ]; then
+                      echo "[dry-run] would delete cache id=${id} key=${key} ref=${ref} size=${size} bytes (PR #${pr_number} is ${pr_state})"
+                    else
+                      echo "deleting cache id=${id} key=${key} ref=${ref} size=${size} bytes (PR #${pr_number} is ${pr_state})"
+                      gh api -X DELETE "repos/${REPO}/actions/caches/${id}"
+                    fi
+                    total_count=$((total_count + 1))
+                    total_bytes=$((total_bytes + size))
+                    ;;
+                esac
+              done < /tmp/pr_caches.tsv
+            fi
+          done < /tmp/pr_numbers.txt
+
+          if [ "${DRY_RUN}" = "true" ]; then
+            echo "PR-cache prune (dry-run) totals: ${total_count} cache(s), ${total_bytes} byte(s) would be reclaimed"
+          else
+            echo "PR-cache prune totals: ${total_count} cache(s) deleted, ${total_bytes} byte(s) reclaimed"
+          fi
+
+  usage-snapshot:
+    name: Final usage snapshot
+    needs: [prune-artifacts, prune-pr-caches]
+    if: always() && needs.prune-artifacts.result == 'success' && (needs.prune-pr-caches.result == 'success' || needs.prune-pr-caches.result == 'skipped')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Print remaining cache and artifact usage
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          echo "=== Cache usage (${REPO}) ==="
+          gh api "repos/${REPO}/actions/cache/usage"
+
+          echo "=== Artifact totals (${REPO}) ==="
+          gh api --paginate "repos/${REPO}/actions/artifacts" \
+            --jq '.artifacts[] | select(.expired == false) | .size_in_bytes' \
+            > /tmp/remaining_sizes.txt
+
+          remaining_count=$(wc -l < /tmp/remaining_sizes.txt | tr -d ' ')
+          remaining_bytes=$(awk '{sum+=$1} END {print sum+0}' /tmp/remaining_sizes.txt)
+          echo "remaining non-expired artifacts: ${remaining_count}"
+          echo "remaining non-expired artifact bytes: ${remaining_bytes}"

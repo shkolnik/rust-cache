@@ -196,6 +196,53 @@ branches.
 The caches can be controlled using the [Cache API](https://docs.github.com/en/rest/actions/cache)
 which allows listing existing caches and manually removing entries.
 
+## Storage Janitor
+
+`.github/workflows/janitor.yml` is a separate, reusable (`workflow_call`) workflow —
+unrelated to the `Swatinem/rust-cache` action itself — that prunes GitHub Actions
+storage for a caller repository: old non-expired artifacts, and caches belonging
+to closed/merged PRs. It never touches GitHub Releases or release assets.
+
+Call it from a scheduled workflow in your repo:
+
+```yaml
+name: Storage janitor
+
+on:
+  schedule:
+    - cron: "0 9 * * 0" # weekly, off-peak UTC
+  workflow_dispatch:
+    inputs:
+      dry-run:
+        description: "Log what would be deleted without deleting anything"
+        type: boolean
+        default: false
+
+jobs:
+  janitor:
+    uses: shkolnik/rust-cache/.github/workflows/janitor.yml@main
+    permissions:
+      actions: write
+      pull-requests: read
+    with:
+      artifact-retention-days: 7
+      prune-pr-caches: true
+      dry-run: ${{ inputs.dry-run || false }}
+```
+
+Inputs:
+
+| input | type | default | description |
+| --- | --- | --- | --- |
+| `artifact-retention-days` | number | `7` | delete non-expired artifacts older than this many days |
+| `prune-pr-caches` | boolean | `true` | delete Actions caches whose ref belongs to a closed/merged PR |
+| `dry-run` | boolean | `false` | log what would be deleted without deleting anything |
+
+The caller needs `permissions: actions: write` so the inherited `GITHUB_TOKEN`
+can list and delete artifacts/caches, and `pull-requests: read` so `gh pr
+view` can look up PR state for the PR-cache prune step. No PAT or admin scope
+is needed.
+
 ## Debugging
 
 The action prints detailed information about which information it considers
