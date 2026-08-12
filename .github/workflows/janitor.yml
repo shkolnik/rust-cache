@@ -11,7 +11,7 @@ name: Storage janitor
 #
 #   jobs:
 #     janitor:
-#       uses: shkolnik/rust-cache/.github/workflows/janitor.yml@main
+#       uses: shkolnik/rust-cache/.github/workflows/janitor.yml@master
 #       with:
 #         artifact-retention-days: 7
 #         prune-pr-caches: true

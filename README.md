@@ -220,7 +220,7 @@ on:
 
 jobs:
   janitor:
-    uses: shkolnik/rust-cache/.github/workflows/janitor.yml@main
+    uses: shkolnik/rust-cache/.github/workflows/janitor.yml@master
     permissions:
       actions: write
       pull-requests: read
