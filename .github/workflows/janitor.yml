@@ -18,11 +18,13 @@ name: Storage janitor
 #         dry-run: false
 #       permissions:
 #         actions: write
+#         pull-requests: read
 #
 # The caller's `secrets.GITHUB_TOKEN` is inherited automatically by reusable
 # workflows called via `uses:` in the same job — no explicit secret passing
 # is required. The token needs `actions: write` (set via `permissions:` on
-# the caller job) to list/delete artifacts and caches.
+# the caller job) to list/delete artifacts and caches, and `pull-requests:
+# read` so `gh pr view` can look up PR state for the PR-cache prune step.
 
 on:
   workflow_call:
@@ -42,6 +44,7 @@ on:
 
 permissions:
   actions: write
+  pull-requests: read
 
 jobs:
   prune-artifacts:

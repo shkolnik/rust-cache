@@ -223,6 +223,7 @@ jobs:
     uses: shkolnik/rust-cache/.github/workflows/janitor.yml@main
     permissions:
       actions: write
+      pull-requests: read
     with:
       artifact-retention-days: 7
       prune-pr-caches: true
@@ -237,9 +238,10 @@ Inputs:
 | `prune-pr-caches` | boolean | `true` | delete Actions caches whose ref belongs to a closed/merged PR |
 | `dry-run` | boolean | `false` | log what would be deleted without deleting anything |
 
-The caller's `permissions: actions: write` is required so the inherited
-`GITHUB_TOKEN` can list and delete artifacts/caches. No PAT or admin scope is
-needed.
+The caller needs `permissions: actions: write` so the inherited `GITHUB_TOKEN`
+can list and delete artifacts/caches, and `pull-requests: read` so `gh pr
+view` can look up PR state for the PR-cache prune step. No PAT or admin scope
+is needed.
 
 ## Debugging
 
